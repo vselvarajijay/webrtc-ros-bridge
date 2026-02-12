@@ -1,0 +1,13 @@
+# Python dependencies for ROS2 WebRTC Bridge
+# WebRTC support
+aiortc>=1.0.0
+aiohttp>=3.8.0
+
+# Image processing
+# Pin NumPy to <2.0 for compatibility with cv_bridge and other ROS2 packages
+# Note: opencv-python-headless may show warning but works with numpy 1.x
+numpy>=1.24.0,<2.0.0
+opencv-python-headless>=4.8.0,<4.13.0
+
+# HTTP client for control commands
+requests>=2.31.0

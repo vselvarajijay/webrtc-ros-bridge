@@ -1,0 +1,7 @@
+# Request
+string command_type
+string command_data
+---
+# Response
+bool success
+string message

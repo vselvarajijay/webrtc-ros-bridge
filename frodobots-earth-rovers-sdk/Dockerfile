@@ -6,10 +6,12 @@ ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install necessary packages and Chromium
+# Note: fonts-kacst may not be available in all Debian versions, so install it separately
 RUN apt-get update \
   && apt-get install -y wget gnupg \
-  && apt-get install -y chromium fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-khmeros fonts-kacst fonts-freefont-ttf libxss1 \
+  && apt-get install -y chromium fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-khmeros fonts-freefont-ttf libxss1 \
   --no-install-recommends \
+  && (apt-get install -y fonts-kacst || true) \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 

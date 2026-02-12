@@ -1,0 +1,81 @@
+services:
+  ros2_bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    container_name: ros2_bridge
+    image: ros2-webrtc-bridge:latest
+    platform: linux/amd64
+    
+    # Volume mounts for development (live code editing)
+    volumes:
+      - ./src:/workspace/src:rw
+      - ./install:/workspace/install:rw
+      - ./log:/workspace/log:rw
+      - ./scripts:/workspace/scripts:ro
+    
+    # Port mappings
+    ports:
+      - "8080:8080"  # WebRTC signaling
+      - "11311:11311"  # ROS master
+    
+    # Environment variables
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      - SDK_URL=http://frodobots_sdk:8000
+      - WEBRTC_SIGNALING_PORT=8080
+    
+    # Wait for SDK to be ready
+    depends_on:
+      - frodobots_sdk
+    
+    # Keep container running with bash
+    stdin_open: true
+    tty: true
+    
+    # Command to keep container alive
+    # The ROS2 entrypoint already sources /opt/ros/humble/setup.bash
+    # We just need to keep the container running
+    command: tail -f /dev/null
+
+  frodobots_sdk:
+    build:
+      context: ../frodobots-earth-rovers-sdk
+      dockerfile: Dockerfile
+    container_name: frodobots_sdk
+    image: frodobots-sdk:latest
+    
+    # Port mappings
+    ports:
+      - "8000:8000"  # FastAPI service
+    
+    # Environment variables (from .env file)
+    environment:
+      - SDK_API_TOKEN=${SDK_API_TOKEN}
+      - BOT_SLUG=${BOT_SLUG}
+      - MISSION_SLUG=${MISSION_SLUG:-}
+      - CHROME_EXECUTABLE_PATH=/usr/bin/chromium
+      - MAP_ZOOM_LEVEL=${MAP_ZOOM_LEVEL:-18}
+      - IMAGE_FORMAT=${IMAGE_FORMAT:-png}
+      - IMAGE_QUALITY=${IMAGE_QUALITY:-1.0}
+      - DEBUG=${DEBUG:-false}
+    
+    # Volume mounts
+    volumes:
+      - ../frodobots-earth-rovers-sdk/screenshots:/app/screenshots:rw
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# Default network allows containers to communicate by service name
+networks:
+  default:
+    name: ros2_bridge_network
