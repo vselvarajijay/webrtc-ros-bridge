@@ -1,0 +1,23 @@
+frodobots_bridge:
+  ros__parameters:
+    # SDK connection settings (Frodobots-specific)
+    sdk_url: "http://localhost:8000"
+    webrtc_signaling_port: 8080
+    
+    # Standardized ROS2 topics (same for all SDKs)
+    video_topic_front: "/robot/video/front"
+    video_topic_rear: "/robot/video/rear"
+    telemetry_topic: "/robot/telemetry"
+    control_topic: "/robot/control"
+    
+    # Frame IDs (can be SDK-specific for TF tree)
+    frame_id_front: "robot_front_camera"
+    frame_id_rear: "robot_rear_camera"
+    
+    # Publishing settings
+    publish_fps: 30.0
+    
+    # WebRTC Configuration - Track mapping for camera identification
+    # Maps SDK-specific track IDs to standardized camera types
+    webrtc.track_mappings.front.track_id_contains: "1000"
+    webrtc.track_mappings.rear.track_id_contains: "1001"
