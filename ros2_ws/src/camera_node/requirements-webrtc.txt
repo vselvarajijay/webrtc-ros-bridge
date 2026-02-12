@@ -1,0 +1,3 @@
+# Optional dependencies for WebRTC video source (--source webrtc)
+aiortc
+aiohttp
