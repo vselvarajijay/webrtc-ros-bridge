@@ -14,6 +14,9 @@ services:
       - "8001:8001"
     environment:
       - ROS2_APP_BRIDGE_URL=http://ros2_app_bridge:9000
+      - FRODOBOTS_URL=http://frodobots:8000
+    depends_on:
+      - frodobots
     networks:
       - webrtc_ros_network
 

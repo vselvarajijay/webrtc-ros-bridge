@@ -2,3 +2,9 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 websockets>=14.1
+httpx>=0.27.0
+Pillow>=10.0.0
+# WebRTC video track (live frame stream)
+aiortc>=1.6.0
+av>=12.0.0
+numpy>=1.24.0

@@ -42,55 +42,72 @@ function App() {
   const [isConnected, setIsConnected] = useState(false)
   const [controlStatus, setControlStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle')
   const [driveState, setDriveState] = useState<DriveState>({ linear: 0, angular: 0, lamp: 0 })
+  const [videoError, setVideoError] = useState(false)
+  const [videoMode, setVideoMode] = useState<'webrtc' | 'mjpeg'>('webrtc')
   const driveRef = useRef<DriveState>({ linear: 0, angular: 0, lamp: 0 })
   const wsRef = useRef<WebSocket | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const pcRef = useRef<RTCPeerConnection | null>(null)
+  const dataChannelRef = useRef<RTCDataChannel | null>(null)
 
   const sendControl = (linear: number, angular: number, lamp: number) => {
-    fetch(`${API_BASE}/api/control`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: { linear, angular, lamp } }),
-    }).catch(() => {})
+    const payload = { command: { linear, angular, lamp } }
+    const dc = dataChannelRef.current
+    if (dc?.readyState === 'open') {
+      try {
+        dc.send(JSON.stringify(payload))
+      } catch {
+        fetch(`${API_BASE}/api/control`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }).catch(() => {})
+      }
+    } else {
+      fetch(`${API_BASE}/api/control`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).catch(() => {})
+    }
   }
 
   useEffect(() => {
-    // Connect to WebSocket
-    const ws = new WebSocket('ws://localhost:8001/ws')
-    wsRef.current = ws
+    // Delay connect so React Strict Mode cleanup can cancel the first attempt (avoids "closed before connection established")
+    const timeoutId = setTimeout(() => {
+      const ws = new WebSocket('ws://localhost:8001/ws')
+      wsRef.current = ws
 
-    ws.onopen = () => {
-      setIsConnected(true)
-      console.log('WebSocket connected')
-    }
-
-    ws.onmessage = (event) => {
-      try {
-        const message: LogMessage = JSON.parse(event.data)
-        setLogs((prev) => [...prev, message].slice(-100)) // Keep last 100 logs
-      } catch (error) {
-        console.error('Error parsing WebSocket message:', error)
+      ws.onopen = () => {
+        setIsConnected(true)
+        console.log('WebSocket connected')
       }
-    }
 
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error)
-      setIsConnected(false)
-    }
-
-    ws.onclose = () => {
-      setIsConnected(false)
-      console.log('WebSocket disconnected')
-      // Attempt to reconnect after 3 seconds
-      setTimeout(() => {
-        if (wsRef.current?.readyState === WebSocket.CLOSED) {
-          // Reconnect logic handled by useEffect cleanup and re-run
+      ws.onmessage = (event) => {
+        try {
+          const message: LogMessage = JSON.parse(event.data)
+          setLogs((prev) => [...prev, message].slice(-100)) // Keep last 100 logs
+        } catch (error) {
+          console.error('Error parsing WebSocket message:', error)
         }
-      }, 3000)
-    }
+      }
+
+      ws.onerror = () => {
+        setIsConnected(false)
+      }
+
+      ws.onclose = () => {
+        setIsConnected(false)
+      }
+    }, 100)
 
     return () => {
-      ws.close()
+      clearTimeout(timeoutId)
+      if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
+        wsRef.current.close()
+      }
+      wsRef.current = null
     }
   }, [])
 
@@ -99,7 +116,79 @@ function App() {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
 
-  const SEND_INTERVAL_MS = 25 // 40 Hz for smoother continuous motion
+  // WebRTC: video + control data channel; create offer, POST to server, attach remote track to <video>; fallback to MJPEG/HTTP on failure
+  useEffect(() => {
+    let cancelled = false
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    })
+    pcRef.current = pc
+
+    const dc = pc.createDataChannel('control')
+    dataChannelRef.current = dc
+    dc.onopen = () => {
+      if (!cancelled) setVideoMode('webrtc')
+    }
+    dc.onclose = () => {
+      dataChannelRef.current = null
+    }
+    dc.onerror = () => {
+      dataChannelRef.current = null
+    }
+
+    pc.ontrack = (event) => {
+      if (cancelled || !videoRef.current) return
+      const stream = event.streams[0] ?? new MediaStream([event.track])
+      videoRef.current.srcObject = stream
+      setVideoMode('webrtc')
+      setVideoError(false)
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        if (!cancelled) setVideoMode('mjpeg')
+      }
+    }
+
+    const connect = async () => {
+      try {
+        const offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        const res = await fetch(`${API_BASE}/api/webrtc/offer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sdp: pc.localDescription?.sdp, type: pc.localDescription?.type }),
+        })
+        if (cancelled) return
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}))
+          console.warn('WebRTC offer failed:', res.status, data)
+          setVideoMode('mjpeg')
+          return
+        }
+        const answer = await res.json()
+        await pc.setRemoteDescription(new RTCSessionDescription(answer))
+      } catch (e) {
+        if (!cancelled) {
+          console.warn('WebRTC error:', e)
+          setVideoMode('mjpeg')
+        }
+      }
+    }
+    connect()
+
+    return () => {
+      cancelled = true
+      dataChannelRef.current = null
+      pc.close()
+      pcRef.current = null
+      if (videoRef.current) {
+        videoRef.current.srcObject = null
+      }
+    }
+  }, [])
+
+  const SEND_INTERVAL_MS = 20 // 50 Hz for real-time control (robot → ROS2 → webapp and back)
   useEffect(() => {
     const id = setInterval(() => {
       const { linear, angular, lamp } = driveRef.current
@@ -190,13 +279,24 @@ function App() {
 
   const sendFrodobotsControl = async () => {
     setControlStatus('sending')
+    const payload = { command: { linear: 1, angular: 1, lamp: 0 } }
+    const dc = dataChannelRef.current
+    if (dc?.readyState === 'open') {
+      try {
+        dc.send(JSON.stringify(payload))
+        setControlStatus('sent')
+        setTimeout(() => setControlStatus('idle'), 2000)
+      } catch {
+        setControlStatus('error')
+        setTimeout(() => setControlStatus('idle'), 2000)
+      }
+      return
+    }
     try {
       const res = await fetch(`${API_BASE}/api/control`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          command: { linear: 1, angular: 1, lamp: 0 },
-        }),
+        body: JSON.stringify(payload),
       })
       const data = await res.json().catch(() => ({}))
       if (res.ok && data.ok) {
@@ -316,9 +416,40 @@ function App() {
           </Card>
 
           <Card shadow="sm" padding="lg" radius="md" withBorder>
+            <Title order={4} mb="xs">Front camera</Title>
+            <Text size="sm" c="dimmed" mb="sm">
+              {videoMode === 'webrtc'
+                ? 'Live WebRTC stream from robot (via ROS2).'
+                : 'Live MJPEG fallback from robot (via ROS2).'}
+            </Text>
+            <div style={{ minHeight: 240, background: '#1a1b1e', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {videoError ? (
+                <Text size="sm" c="dimmed">Stream unavailable. Ensure app-server is running and ros2_app_bridge is publishing frames.</Text>
+              ) : videoMode === 'webrtc' ? (
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  style={{ maxWidth: '100%', maxHeight: 360, objectFit: 'contain' }}
+                />
+              ) : (
+                <img
+                  src={`${API_BASE}/api/video/front/stream`}
+                  alt="Front camera"
+                  style={{ maxWidth: '100%', maxHeight: 360, objectFit: 'contain' }}
+                  onError={() => setVideoError(true)}
+                  onLoad={() => setVideoError(false)}
+                />
+              )}
+            </div>
+          </Card>
+
+          <Card shadow="sm" padding="lg" radius="md" withBorder>
             <Title order={4} mb="xs">Drive (WASD)</Title>
             <Text size="sm" c="dimmed" mb="sm">
               W forward, S back, A left, D right. Click page to enable.
+              {videoMode === 'webrtc' ? ' Control sent via WebRTC data channel.' : ' Control sent via HTTP.'}
             </Text>
             <Text size="xs" c="dimmed">
               Linear: {driveState.linear.toFixed(2)} · Angular: {driveState.angular.toFixed(2)}

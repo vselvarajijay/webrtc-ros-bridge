@@ -1,5 +1,12 @@
-# Bridge: ROS2 (rclpy) -> app-server HTTP ingest. Uses ROS2 base image; no extra Python deps.
+# Bridge: ROS2 (rclpy) -> app-server HTTP ingest. Subscribes to /robot/video/front, encodes JPEG, POSTs to app-server.
 FROM ros:humble
+
+# sensor_msgs for Image; pip for numpy + opencv (JPEG encode)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-humble-sensor-msgs \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir numpy opencv-python-headless
 
 WORKDIR /app
 COPY main.py .

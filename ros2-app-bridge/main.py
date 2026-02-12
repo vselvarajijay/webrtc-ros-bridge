@@ -2,6 +2,7 @@
 """
 ROS2 -> App-server bridge: subscribes to ROS2 topics and POSTs to /api/ingest.
 Also exposes HTTP POST /control to receive control commands and publish to /robot/control.
+Subscribes to /robot/video/front and POSTs raw BGR frames to app-server (single encode: WebRTC only).
 
 Run in a container with ROS2 (rclpy). Set APP_SERVER_URL (e.g. http://app_server:8001).
 Control server listens on CONTROL_PORT (default 9000).
@@ -13,21 +14,36 @@ import os
 import queue
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 APP_SERVER_URL = os.environ.get("APP_SERVER_URL", "http://localhost:8001")
 INGEST_URL = f"{APP_SERVER_URL.rstrip('/')}/api/ingest"
+VIDEO_FRAME_RAW_URL = f"{APP_SERVER_URL.rstrip('/')}/api/video/frame/raw"
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "9000"))
+
+# Target ~30 FPS; send raw BGR so app-server does single encode (WebRTC only)
+VIDEO_FRAME_TARGET_FPS = 30.0
+VIDEO_FRAME_MIN_INTERVAL_S = 1.0 / VIDEO_FRAME_TARGET_FPS
 
 # Thread-safe queue for control commands (HTTP thread pushes, ROS2 timer drains)
 control_queue: queue.Queue = queue.Queue()
@@ -48,6 +64,41 @@ def post_message(payload: dict) -> bool:
     except urllib.error.URLError as e:
         logger.warning("POST to app-server failed: %s", e)
         return False
+
+
+def image_to_bgr_bytes(msg: Image) -> tuple[bytes, int, int] | None:
+    """Convert sensor_msgs/Image (bgr8 or rgb8) to raw BGR bytes. Returns (bytes, width, height) or None."""
+    if not HAS_CV2:
+        return None
+    try:
+        h, w = msg.height, msg.width
+        if msg.encoding in ("bgr8", "rgb8"):
+            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3))
+            if msg.encoding == "rgb8":
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            return arr.tobytes(), w, h
+        return None
+    except Exception as e:
+        logger.warning("image_to_bgr_bytes failed: %s", e)
+        return None
+
+
+def post_video_frame_raw_sync(bgr_body: bytes, width: int, height: int) -> None:
+    """POST raw BGR bytes to app-server /api/video/frame/raw (blocking; run in executor). Single encode at server."""
+    try:
+        req = urllib.request.Request(
+            VIDEO_FRAME_RAW_URL,
+            data=bgr_body,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "X-Width": str(width),
+                "X-Height": str(height),
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except urllib.error.URLError as e:
+        logger.debug("POST video frame raw failed: %s", e)
 
 
 def make_control_handler(q: queue.Queue):
@@ -101,7 +152,8 @@ def run_control_server(port: int, q: queue.Queue) -> None:
 
 
 class Ros2AppBridge(Node):
-    """Subscribes to /chatter and forwards to app-server; publishes /robot/control from control queue."""
+    """Subscribes to /chatter and /robot/video/front; forwards to app-server; publishes /robot/control from control queue.
+    Video: encode at up to 30 FPS, POST in background (latest-frame only) for real-time low-latency stream."""
 
     def __init__(self):
         super().__init__("ros2_app_bridge")
@@ -112,9 +164,60 @@ class Ros2AppBridge(Node):
             10,
         )
         self.control_pub = self.create_publisher(String, "/robot/control", 10)
-        self.control_timer = self.create_timer(0.1, self._drain_control_queue)
+        # Drain control queue at 50 Hz for minimal latency (robot ← ROS2 ← webapp)
+        self.control_timer = self.create_timer(0.02, self._drain_control_queue)
+        self._last_video_encode_time = 0.0
+        self._video_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video_post")
+        self._video_lock = threading.Lock()
+        self._pending_raw: tuple[bytes, int, int] | None = None
+        self._post_future = None
+        if HAS_CV2:
+            # Queue 1 = always process latest frame only (reduces latency)
+            self.video_sub = self.create_subscription(
+                Image,
+                "/robot/video/front",
+                self._video_callback,
+                1,
+            )
+            self.get_logger().info(
+                f"Bridge: /robot/video/front -> {VIDEO_FRAME_RAW_URL} raw BGR (target {VIDEO_FRAME_TARGET_FPS} FPS, single encode at server)"
+            )
+        else:
+            self.get_logger().warn("cv2 not available; front camera streaming disabled")
         self.get_logger().info(f"Bridge: /chatter -> {INGEST_URL}")
         self.get_logger().info("Bridge: POST /control -> /robot/control")
+
+    def _on_video_post_done(self, future) -> None:
+        """When a POST completes, send pending frame if any (keeps stream real-time)."""
+        with self._video_lock:
+            pending = self._pending_raw
+            self._pending_raw = None
+            self._post_future = None
+        if pending is not None:
+            bgr_bytes, w, h = pending
+            f = self._video_executor.submit(post_video_frame_raw_sync, bgr_bytes, w, h)
+            f.add_done_callback(self._on_video_post_done)
+            with self._video_lock:
+                self._post_future = f
+
+    def _video_callback(self, msg: Image) -> None:
+        """Throttle to target FPS; POST raw BGR in executor (latest-frame only). No encode here → single encode at server."""
+        now = time.monotonic()
+        if now - self._last_video_encode_time < VIDEO_FRAME_MIN_INTERVAL_S:
+            return
+        raw = image_to_bgr_bytes(msg)
+        if raw is None:
+            return
+        bgr_bytes, w, h = raw
+        self._last_video_encode_time = now
+        with self._video_lock:
+            in_flight = self._post_future is not None and not self._post_future.done()
+            if in_flight:
+                self._pending_raw = (bgr_bytes, w, h)
+                return
+            f = self._video_executor.submit(post_video_frame_raw_sync, bgr_bytes, w, h)
+            f.add_done_callback(self._on_video_post_done)
+            self._post_future = f
 
     def callback(self, msg: String) -> None:
         payload = {
@@ -127,14 +230,13 @@ class Ros2AppBridge(Node):
             self.get_logger().warning("Failed to post message to app-server")
 
     def _drain_control_queue(self) -> None:
-        """Drain control queue and publish to /robot/control (called from ROS2 executor)."""
+        """Drain control queue and publish to /robot/control (50 Hz for real-time)."""
         try:
             while True:
                 cmd = control_queue.get_nowait()
                 msg = String()
                 msg.data = json.dumps(cmd)
                 self.control_pub.publish(msg)
-                self.get_logger().info(f"Published control to /robot/control: {cmd}")
         except queue.Empty:
             pass
 
@@ -159,6 +261,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if HAS_CV2 and hasattr(node, "_video_executor"):
+            node._video_executor.shutdown(wait=False)
         node.destroy_node()
         rclpy.shutdown()
 
