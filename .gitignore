@@ -207,3 +207,13 @@ poetry.toml
 pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python,c++
+
+### ROS2 Workspace ###
+# ROS2 build artifacts (colcon build output)
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+# Also ignore at root level if workspace is at root
+build/
+install/
+log/
