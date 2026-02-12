@@ -21,6 +21,8 @@ WORKDIR /app
 # Copy the requirements and source code files
 COPY requirements.txt .
 COPY . .
+# Copy .env so the app can load it (load_dotenv). Create from .env.sample if missing. docker-compose also injects via env_file.
+COPY .env .env
 
 # Create a virtual environment and install Python dependencies
 RUN python3 -m venv venv && \

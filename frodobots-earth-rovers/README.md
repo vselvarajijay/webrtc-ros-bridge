@@ -72,8 +72,22 @@ This SDK is meant to control the bot and at the same time monitor its status. Th
 
 With this endpoint you can send linear and angular values to move the bot, and control the lamp. The linear and angular values are between -1 and 1. The lamp value is 0 (off) or 1 (on).
 
+**Example: send control**
+
+When running the service locally (e.g. `hypercorn main:app --bind 0.0.0.0:8000`), use port 8000. Ensure `frodobots-earth-rovers/.env` exists (copy from `.env.sample`) so the app loads `SDK_API_TOKEN`, `BOT_SLUG`, etc.
+
 ```bash
 curl --location 'http://localhost:8000/control' \
+--header 'Content-Type: application/json' \
+--data '{
+    "command": { "linear": 1, "angular": 1, "lamp": 0 }
+}'
+```
+
+When running via the repo root **docker-compose**, the service is exposed on **port 8002**. The container uses `frodobots-earth-rovers/.env` (via `env_file`). **Required:** set `SDK_API_TOKEN` and `BOT_SLUG` in `.env` (from [Frodobots](https://my.frodobots.com/owner/settings)); otherwise `/control` returns an error. Use:
+
+```bash
+curl --location 'http://localhost:8002/control' \
 --header 'Content-Type: application/json' \
 --data '{
     "command": { "linear": 1, "angular": 1, "lamp": 0 }

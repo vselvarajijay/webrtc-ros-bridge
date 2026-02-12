@@ -1,8 +1,7 @@
-# Global docker-compose: app-server, ros2-app-bridge, ros2_ws (ROS2 bridge).
+# Global docker-compose: app-server, ros2-app-bridge, ros2_ws (ROS2 bridge), frodobots.
 # Run from repo root: docker-compose up -d
 #
-# frodobots-earth-rovers-sdk is used as an SDK (library/code), not run as a container here.
-# If you need the SDK service, start it separately or add it to this file.
+# frodobots-earth-rovers service is defined below; ros2_bridge uses SDK_URL to reach it.
 
 services:
   app_server:
@@ -13,6 +12,8 @@ services:
     image: app-server:latest
     ports:
       - "8001:8001"
+    environment:
+      - ROS2_APP_BRIDGE_URL=http://ros2_app_bridge:9000
     networks:
       - webrtc_ros_network
 
@@ -22,9 +23,12 @@ services:
       dockerfile: Dockerfile
     container_name: ros2_app_bridge
     image: ros2-app-bridge:latest
+    ports:
+      - "9000:9000"
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - APP_SERVER_URL=http://app_server:8001
+      - CONTROL_PORT=9000
     depends_on:
       - app_server
     networks:
@@ -41,7 +45,7 @@ services:
     platform: linux/amd64
     volumes:
       - ./ros2_ws/src:/workspace/src:rw
-      - ./ros2_ws/install:/workspace/install:rw
+      # Do not mount install: use the install built in the image so sdk_bridge_core_interfaces and correct Python imports are used
       - ./ros2_ws/log:/workspace/log:rw
       - ./ros2_ws/scripts:/workspace/scripts:ro
     ports:
@@ -50,11 +54,47 @@ services:
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
-      - SDK_URL=${SDK_URL:-}
+      - SDK_URL=${SDK_URL:-http://frodobots:8000}
       - WEBRTC_SIGNALING_PORT=8080
+    depends_on:
+      - frodobots
     stdin_open: true
     tty: true
-    command: tail -f /dev/null
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash
+      && source /workspace/install/setup.bash
+      && ros2 launch frodobots_bridge frodobots_bridge.launch.py
+      sdk_url:=http://frodobots:8000"
+    networks:
+      - webrtc_ros_network
+
+  frodobots:
+    build:
+      context: ./frodobots-earth-rovers
+      dockerfile: Dockerfile
+    container_name: frodobots
+    image: frodobots-earth-rovers:latest
+    env_file:
+      - ./frodobots-earth-rovers/.env
+    ports:
+      - "8002:8000"   # Host 8002 to avoid conflict with other services on 8000
+    environment:
+      - SDK_API_TOKEN=${SDK_API_TOKEN}
+      - BOT_SLUG=${BOT_SLUG}
+      - MISSION_SLUG=${MISSION_SLUG:-}
+      - CHROME_EXECUTABLE_PATH=/usr/bin/chromium
+      - MAP_ZOOM_LEVEL=${MAP_ZOOM_LEVEL:-18}
+      - IMAGE_FORMAT=${IMAGE_FORMAT:-png}
+      - IMAGE_QUALITY=${IMAGE_QUALITY:-1.0}
+      - DEBUG=${DEBUG:-false}
+    volumes:
+      - ./frodobots-earth-rovers/screenshots:/app/screenshots:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
     networks:
       - webrtc_ros_network
 

@@ -11,7 +11,7 @@ SERVICE=${1:-}
 
 if [ -z "$SERVICE" ]; then
     echo "Viewing logs for all services..."
-    echo "Usage: $0 [ros2_bridge|frodobots_sdk]"
+    echo "Usage: $0 [ros2_bridge|frodobots]"
     echo ""
     docker-compose logs -f
 else

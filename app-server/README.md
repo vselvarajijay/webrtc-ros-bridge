@@ -25,7 +25,7 @@ cd ros2_ws
 docker-compose up -d
 ```
 
-This starts **ros2_bridge**, **app_server**, **ros2_app_bridge**, and **frodobots_sdk**. The bridge subscribes to ROS2 and POSTs to `http://app_server:8001/api/ingest`. Run the talker (e.g. `./start-talker.sh` from app-server) and the React app (`cd app && pnpm dev`). Logs from `/chatter` appear in the UI.
+This starts **ros2_bridge**, **app_server**, **ros2_app_bridge**, and **frodobots**. The bridge subscribes to ROS2 and POSTs to `http://app_server:8001/api/ingest`. Run the talker (e.g. `./start-talker.sh` from app-server) and the React app (`cd app && pnpm dev`). Logs from `/chatter` appear in the UI.
 
 ## Architecture
 

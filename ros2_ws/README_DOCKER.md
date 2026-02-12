@@ -40,7 +40,7 @@ The Docker setup consists of two containers:
    - ROS2 topics and services
    - Standardized bridge interface
 
-2. **frodobots_sdk**: Frodobots SDK service
+2. **frodobots**: Frodobots SDK service
    - FastAPI service on port 8000
    - WebRTC streaming from robot
    - HTTP control endpoints
@@ -68,7 +68,7 @@ docker-compose build
 docker-compose build ros2_bridge
 
 # Build Frodobots SDK only
-docker-compose build frodobots_sdk
+docker-compose build frodobots
 ```
 
 ## Running the Containers
@@ -99,7 +99,7 @@ docker-compose ps
 
 # Specific service
 ./scripts/docker-logs.sh ros2_bridge
-./scripts/docker-logs.sh frodobots_sdk
+./scripts/docker-logs.sh frodobots
 ```
 
 ### Stop Containers
@@ -182,7 +182,7 @@ ros2 topic pub /robot/control std_msgs/String '{"data": "{\"command_type\":\"mov
 
 Containers communicate via Docker's default bridge network:
 
-- ROS2 bridge → SDK: `http://frodobots_sdk:8000`
+- ROS2 bridge → SDK: `http://frodobots:8000`
 - SDK → ROS2 bridge WebRTC: `http://ros2_bridge:8080/offer`
 
 ### External Access (from Mac)
@@ -283,7 +283,7 @@ lsof -i :8000
 ```bash
 # Check logs
 docker-compose logs ros2_bridge
-docker-compose logs frodobots_sdk
+docker-compose logs frodobots
 
 # Start in foreground to see errors
 docker-compose up
@@ -308,7 +308,7 @@ docker build -t test .
 
 2. Test connectivity:
    ```bash
-   docker-compose exec ros2_bridge curl http://frodobots_sdk:8000/
+   docker-compose exec ros2_bridge curl http://frodobots:8000/
    ```
 
 3. Check firewall settings on Mac
@@ -329,10 +329,10 @@ The Frodobots SDK needs to authenticate before the bridge can connect:
 
 ```bash
 # Check SDK logs
-docker-compose logs frodobots_sdk
+docker-compose logs frodobots
 
 # Authenticate SDK (if needed)
-docker-compose exec frodobots_sdk curl -X POST http://localhost:8000/start-mission
+docker-compose exec frodobots curl -X POST http://localhost:8000/start-mission
 ```
 
 ## Helper Scripts

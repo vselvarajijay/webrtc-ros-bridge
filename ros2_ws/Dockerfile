@@ -32,9 +32,8 @@ RUN pip3 install --no-cache-dir -r /workspace/requirements.txt
 # Copy ROS2 workspace source
 COPY src/ /workspace/src/
 
-# Build the workspace
-RUN cd /workspace && \
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+# Build the workspace (source ROS2 so ament_cmake packages find ament_cmake)
+RUN /bin/bash -c "source /opt/ros/humble/setup.bash && cd /workspace && colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release"
 
 # Source ROS2 setup in bashrc
 RUN echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc && \

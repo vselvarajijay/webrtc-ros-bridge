@@ -49,17 +49,30 @@ class FrodobotsHTTPControl:
                 async with session.post(
                     self.control_endpoint,
                     json={"command": command},
-                    timeout=aiohttp.ClientTimeout(total=5.0),
+                    timeout=aiohttp.ClientTimeout(total=10.0),
                 ) as response:
+                    response_text = await response.text()
+                    logger.info(
+                        "Frodobots response: status=%s body=%s",
+                        response.status,
+                        response_text.strip() or "(empty)",
+                    )
                     if response.status == 200:
-                        logger.debug(f"Control command sent successfully: {command}")
+                        logger.info("Control command sent successfully: %s", command)
                         return True
                     else:
-                        error_text = await response.text()
-                        logger.error(f"Control command failed: {response.status} - {error_text}")
+                        logger.error(
+                            "Control command failed: %s - %s",
+                            response.status,
+                            response_text,
+                        )
                         return False
         except Exception as e:
-            logger.error(f"Error sending control command: {e}")
+            logger.error(
+                "Error sending control command: %s: %s",
+                type(e).__name__,
+                str(e).strip() or repr(e),
+            )
             return False
 
     def send_command(self, command: Dict) -> bool:
@@ -97,16 +110,29 @@ class FrodobotsHTTPControl:
                 response = requests.post(
                     self.control_endpoint,
                     json={"command": command},
-                    timeout=5.0,
+                    timeout=10.0,
+                )
+                logger.info(
+                    "Frodobots response: status=%s body=%s",
+                    response.status_code,
+                    (response.text or "").strip() or "(empty)",
                 )
                 if response.status_code == 200:
-                    logger.debug(f"Control command sent successfully: {command}")
+                    logger.info("Control command sent successfully: %s", command)
                     return True
                 else:
-                    logger.error(f"Control command failed: {response.status_code} - {response.text}")
+                    logger.error(
+                        "Control command failed: %s - %s",
+                        response.status_code,
+                        response.text,
+                    )
                     return False
         except Exception as e:
-            logger.error(f"Error sending control command: {e}")
+            logger.error(
+                "Error sending control command: %s: %s",
+                type(e).__name__,
+                str(e).strip() or repr(e),
+            )
             return False
 
     def convert_ros2_to_frodobots(self, ros2_command: Dict) -> Dict:

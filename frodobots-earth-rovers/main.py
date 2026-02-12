@@ -94,6 +94,21 @@ app.mount("/static", StaticFiles(directory="./static"), name="static")
 browser_service = BrowserService()
 
 
+@app.on_event("startup")
+def log_env_config():
+    """Log env vars from .env at startup (SDK_API_TOKEN masked)."""    
+    token = os.getenv("SDK_API_TOKEN") or ""        
+    logger.info(
+        "Env config: SDK_API_TOKEN=%s BOT_SLUG=%s CHROME_EXECUTABLE_PATH=%s "
+        "MAP_ZOOM_LEVEL=%s MISSION_SLUG=%s",
+        "set" if token else "(not set)",
+        os.getenv("BOT_SLUG", "(not set)"),
+        os.getenv("CHROME_EXECUTABLE_PATH", "(not set)"),
+        os.getenv("MAP_ZOOM_LEVEL", "(not set)"),
+        os.getenv("MISSION_SLUG", "(not set)"),
+    )
+
+
 async def auth_common():
     global auth_response_data
     auth_response_data = get_env_tokens()
@@ -107,7 +122,11 @@ async def auth_common():
 
     if not auth_header:
         raise HTTPException(
-            status_code=500, detail="Authorization header not configured"
+            status_code=500,
+            detail=(
+                "SDK_API_TOKEN not set. Set it in frodobots-earth-rovers/.env "
+                "(copy from .env.sample) or pass it in the environment."
+            ),
         )
     if not bot_slug:
         raise HTTPException(status_code=500, detail="Bot name not configured")
@@ -235,7 +254,11 @@ async def get_checkpoints_list():
 
     if not auth_header:
         raise HTTPException(
-            status_code=500, detail="Authorization header not configured"
+            status_code=500,
+            detail=(
+                "SDK_API_TOKEN not set. Set it in frodobots-earth-rovers/.env "
+                "(copy from .env.sample) or pass it in the environment."
+            ),
         )
     if not bot_slug:
         raise HTTPException(status_code=500, detail="Bot name not configured")
@@ -397,13 +420,17 @@ async def control(request: Request):
     body = await request.json()
     command = body.get("command")
     if not command:
+        logger.warning("POST /control: command not provided")
         raise HTTPException(status_code=400, detail="Command not provided")
 
+    logger.info("POST /control received: command=%s", command)
     try:
         await browser_service.send_message(command)
-        return {"message": "Command sent successfully"}
+        response = {"message": "Command sent successfully"}
+        logger.info("POST /control response: %s", response)
+        return response
     except Exception as e:
-        logger.error("Error sending control command: %s", str(e))
+        logger.error("POST /control error: %s", str(e))
         raise HTTPException(
             status_code=500, detail="Failed to send control command"
         ) from e
@@ -626,7 +653,11 @@ async def start_intervention(request: Request):
 
     if not auth_header:
         raise HTTPException(
-            status_code=500, detail="Authorization header not configured"
+            status_code=500,
+            detail=(
+                "SDK_API_TOKEN not set. Set it in frodobots-earth-rovers/.env "
+                "(copy from .env.sample) or pass it in the environment."
+            ),
         )
     if not bot_slug:
         raise HTTPException(status_code=500, detail="Bot name not configured")
@@ -687,7 +718,11 @@ async def end_intervention(request: Request):
 
     if not auth_header:
         raise HTTPException(
-            status_code=500, detail="Authorization header not configured"
+            status_code=500,
+            detail=(
+                "SDK_API_TOKEN not set. Set it in frodobots-earth-rovers/.env "
+                "(copy from .env.sample) or pass it in the environment."
+            ),
         )
     if not bot_slug:
         raise HTTPException(status_code=500, detail="Bot name not configured")
@@ -743,7 +778,11 @@ async def interventions_history():
 
     if not auth_header:
         raise HTTPException(
-            status_code=500, detail="Authorization header not configured"
+            status_code=500,
+            detail=(
+                "SDK_API_TOKEN not set. Set it in frodobots-earth-rovers/.env "
+                "(copy from .env.sample) or pass it in the environment."
+            ),
         )
     if not bot_slug:
         raise HTTPException(status_code=500, detail="Bot name not configured")

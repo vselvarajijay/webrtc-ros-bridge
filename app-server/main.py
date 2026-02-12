@@ -8,6 +8,9 @@ ROS2 and POSTs messages here; we broadcast to WebSocket clients.
 
 import json
 import logging
+import os
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Set
@@ -21,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Store active WebSocket connections (frontend clients)
 active_connections: Set[WebSocket] = set()
+
+# URL of ros2-app-bridge control endpoint (e.g. http://ros2_app_bridge:9000)
+ROS2_APP_BRIDGE_URL = os.environ.get("ROS2_APP_BRIDGE_URL", "http://ros2_app_bridge:9000").rstrip("/")
 
 
 async def broadcast_message(message: dict) -> None:
@@ -45,6 +51,20 @@ class IngestMessage(BaseModel):
     data: str
     timestamp: str | None = None
     type: str = "std_msgs/String"
+
+
+class ControlCommand(BaseModel):
+    """Frodobots control: linear and angular in [-1, 1], lamp 0 or 1."""
+
+    linear: float = 0.0
+    angular: float = 0.0
+    lamp: int = 0
+
+
+class ControlBody(BaseModel):
+    """POST /api/control body: { \"command\": { linear, angular, lamp } }."""
+
+    command: ControlCommand
 
 
 @asynccontextmanager
@@ -85,6 +105,37 @@ async def ingest(message: IngestMessage):
     }
     await broadcast_message(payload)
     return {"ok": True}
+
+
+@app.post("/api/control")
+def control(body: ControlBody):
+    """Forward control command to ros2-app-bridge (publishes to /robot/control)."""
+    cmd = {
+        "linear": body.command.linear,
+        "angular": body.command.angular,
+        "lamp": body.command.lamp,
+    }
+    data = json.dumps({"command": cmd}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ROS2_APP_BRIDGE_URL}/control",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+            logger.info(
+                "Control forward response: status=%s body=%s",
+                resp.status,
+                body.strip() or "(empty)",
+            )
+            if 200 <= resp.status < 300:
+                return {"ok": True}
+            return {"ok": False, "error": f"Bridge returned {resp.status}"}
+    except urllib.error.URLError as e:
+        logger.warning("Forward to ros2-app-bridge failed: %s", e)
+        return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
 
 
 @app.websocket("/ws")

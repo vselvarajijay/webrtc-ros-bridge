@@ -30,7 +30,7 @@ docker-compose up -d
 docker-compose ps
 ```
 
-This starts **ros2_bridge**, **app_server**, **ros2_app_bridge**, and **frodobots_sdk**. The app-server is available at `http://localhost:8001` and WebSocket at `ws://localhost:8001/ws`.
+This starts **ros2_bridge**, **app_server**, **ros2_app_bridge**, and **frodobots**. The app-server is available at `http://localhost:8001` and WebSocket at `ws://localhost:8001/ws`.
 
 ### 2. Set ROS_DOMAIN_ID (for bridge and ROS2)
 

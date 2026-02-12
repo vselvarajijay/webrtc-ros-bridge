@@ -25,12 +25,12 @@ services:
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
       - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
-      - SDK_URL=http://frodobots_sdk:8000
+      - SDK_URL=http://frodobots:8000
       - WEBRTC_SIGNALING_PORT=8080
     
     # Wait for SDK to be ready
     depends_on:
-      - frodobots_sdk
+      - frodobots
     
     # Keep container running with bash
     stdin_open: true
@@ -62,12 +62,12 @@ services:
     depends_on:
       - app_server
 
-  frodobots_sdk:
+  frodobots:
     build:
-      context: ../frodobots-earth-rovers-sdk
+      context: ../frodobots-earth-rovers
       dockerfile: Dockerfile
-    container_name: frodobots_sdk
-    image: frodobots-sdk:latest
+    container_name: frodobots
+    image: frodobots-earth-rovers:latest
     
     # Port mappings
     ports:
@@ -86,7 +86,7 @@ services:
     
     # Volume mounts
     volumes:
-      - ../frodobots-earth-rovers-sdk/screenshots:/app/screenshots:rw
+      - ../frodobots-earth-rovers/screenshots:/app/screenshots:rw
     
     # Health check
     healthcheck:

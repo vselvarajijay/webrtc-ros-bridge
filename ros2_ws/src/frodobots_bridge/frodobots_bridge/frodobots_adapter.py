@@ -17,7 +17,7 @@ import json
 import logging
 
 from sdk_bridge_core.base.sdk_bridge_base import SDKBridgeBase
-from sdk_bridge_core.interfaces.msg import StreamTelemetry
+from sdk_bridge_core_interfaces.msg import StreamTelemetry
 from sdk_bridge_core.webrtc import WebRTCReceiver, TrackMapper
 from frodobots_bridge.http_control import FrodobotsHTTPControl
 
@@ -39,9 +39,8 @@ class FrodobotsAdapter(SDKBridgeBase):
         # Get parameters
         self.declare_parameters()
         
-        # Initialize components
+        # Initialize components (webrtc_receiver is set via _set_webrtc_receiver from base)
         self.bridge = CvBridge()
-        self.webrtc_receiver = None
         self.http_control = None
         
         # Telemetry data cache
@@ -95,15 +94,15 @@ class FrodobotsAdapter(SDKBridgeBase):
                 # Create track mapper with Frodobots-specific mappings
                 track_mapper = TrackMapper(webrtc_config)
                 
-                # Initialize standardized WebRTC receiver
-                self.webrtc_receiver = WebRTCReceiver(
+                # Initialize standardized WebRTC receiver (set via base class setter)
+                receiver = WebRTCReceiver(
                     port=webrtc_port,
                     track_mapper=track_mapper,
                     video_callback=self._on_video_frame_received,
                     telemetry_callback=self._on_telemetry_received,
                 )
-                self.webrtc_receiver.start()
-                self._set_webrtc_receiver(self.webrtc_receiver)
+                receiver.start()
+                self._set_webrtc_receiver(receiver)
             else:
                 self.node.get_logger().error("WebRTC configuration not available")
                 return False
@@ -208,7 +207,8 @@ class FrodobotsAdapter(SDKBridgeBase):
             return success
 
         except Exception as e:
-            self.node.get_logger().error(f"Error handling control command: {e}")
+            msg = str(e).strip() or repr(e)
+            self.node.get_logger().error(f"Error handling control command: {type(e).__name__}: {msg}")
             return False
 
     def stop(self) -> None:
