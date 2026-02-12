@@ -1,0 +1,63 @@
+# Global docker-compose: app-server, ros2-app-bridge, ros2_ws (ROS2 bridge).
+# Run from repo root: docker-compose up -d
+#
+# frodobots-earth-rovers-sdk is used as an SDK (library/code), not run as a container here.
+# If you need the SDK service, start it separately or add it to this file.
+
+services:
+  app_server:
+    build:
+      context: ./app-server
+      dockerfile: Dockerfile
+    container_name: app_server
+    image: app-server:latest
+    ports:
+      - "8001:8001"
+    networks:
+      - webrtc_ros_network
+
+  ros2_app_bridge:
+    build:
+      context: ./ros2-app-bridge
+      dockerfile: Dockerfile
+    container_name: ros2_app_bridge
+    image: ros2-app-bridge:latest
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - APP_SERVER_URL=http://app_server:8001
+    depends_on:
+      - app_server
+    networks:
+      - webrtc_ros_network
+
+  ros2_bridge:
+    build:
+      context: ./ros2_ws
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+    container_name: ros2_bridge
+    image: ros2-webrtc-bridge:latest
+    platform: linux/amd64
+    volumes:
+      - ./ros2_ws/src:/workspace/src:rw
+      - ./ros2_ws/install:/workspace/install:rw
+      - ./ros2_ws/log:/workspace/log:rw
+      - ./ros2_ws/scripts:/workspace/scripts:ro
+    ports:
+      - "8080:8080"
+      - "11311:11311"
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      - SDK_URL=${SDK_URL:-}
+      - WEBRTC_SIGNALING_PORT=8080
+    stdin_open: true
+    tty: true
+    command: tail -f /dev/null
+    networks:
+      - webrtc_ros_network
+
+networks:
+  webrtc_ros_network:
+    name: webrtc_ros_network

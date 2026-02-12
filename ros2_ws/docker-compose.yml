@@ -41,6 +41,27 @@ services:
     # We just need to keep the container running
     command: tail -f /dev/null
 
+  app_server:
+    build:
+      context: ../app-server
+      dockerfile: Dockerfile
+    container_name: app_server
+    image: app-server:latest
+    ports:
+      - "8001:8001"
+
+  ros2_app_bridge:
+    build:
+      context: ../ros2-app-bridge
+      dockerfile: Dockerfile
+    container_name: ros2_app_bridge
+    image: ros2-app-bridge:latest
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - APP_SERVER_URL=http://app_server:8001
+    depends_on:
+      - app_server
+
   frodobots_sdk:
     build:
       context: ../frodobots-earth-rovers-sdk
