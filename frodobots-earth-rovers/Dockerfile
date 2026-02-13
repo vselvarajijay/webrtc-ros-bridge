@@ -5,11 +5,15 @@ FROM --platform=linux/arm64/v8 python:3.9
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install necessary packages and Chromium
+# Install necessary packages and Chromium with all required dependencies
 # Note: fonts-kacst may not be available in all Debian versions, so install it separately
 RUN apt-get update \
   && apt-get install -y wget gnupg \
-  && apt-get install -y chromium fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-khmeros fonts-freefont-ttf libxss1 \
+  && apt-get install -y chromium \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-thai-tlwg fonts-khmeros fonts-freefont-ttf \
+    libxss1 libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libxcomposite1 \
+    libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libatspi2.0-0 \
+    libgtk-3-0 libxshmfence1 \
   --no-install-recommends \
   && (apt-get install -y fonts-kacst || true) \
   && apt-get clean \

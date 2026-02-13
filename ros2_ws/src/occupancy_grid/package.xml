@@ -1,19 +1,18 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>frodobots_bridge</name>
+  <name>occupancy_grid</name>
   <version>0.1.0</version>
-  <description>Frodobots SDK bridge adapter for ROS2</description>
+  <description>Floor occupancy grid from camera: segmentation, BEV, annotated video</description>
   <maintainer email="user@example.com">dgx-ros2</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
-  <depend>sdk_bridge_core</depend>
-  <depend>sdk_bridge_core_interfaces</depend>
-  <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>occupancy_grid</exec_depend>
+  <depend>nav_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>geometry_msgs</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 

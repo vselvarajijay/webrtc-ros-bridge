@@ -42,6 +42,7 @@ def _run_loop(
     track_mapper: TrackMapper,
     video_callback: Optional[Callable],
     telemetry_callback: Optional[Callable],
+    control_callback: Optional[Callable],
     ready_event: threading.Event,
 ):
     """Run the asyncio event loop for WebRTC signaling."""
@@ -109,23 +110,57 @@ def _run_loop(
             logger.info(f"Video track ended ({camera_type}, total frames: {recv_count})")
 
     async def handle_data_channel(channel: RTCDataChannel):
-        """Handle telemetry data from WebRTC data channel."""
+        """Handle telemetry and control data from WebRTC data channel."""
+        @channel.on("open")
+        def on_open():
+            logger.info(f"Data channel opened: {channel.label}")
+        
+        @channel.on("close")
+        def on_close():
+            logger.info(f"Data channel closed: {channel.label}")
+        
+        @channel.on("error")
+        def on_error(error):
+            logger.error(f"Data channel error ({channel.label}): {error}")
+        
         @channel.on("message")
         def on_message(message):
             try:
                 if isinstance(message, str):
                     data = json.loads(message)
-                    if telemetry_callback:
+                    
+                    # Check if this is a control command (has 'command' field or control-related fields)
+                    is_control = (
+                        "command" in data or
+                        "linear" in data or
+                        "angular" in data or
+                        "lamp" in data or
+                        channel.label == "control"
+                    )
+                    
+                    if is_control and control_callback:
+                        # Handle control command
+                        try:
+                            # Extract command if nested
+                            cmd = data.get("command", data)
+                            control_callback(cmd)
+                            logger.debug(f"Control command forwarded via callback: {cmd}")
+                        except Exception as e:
+                            logger.error(f"Error in control callback: {e}")
+                    elif telemetry_callback:
+                        # Handle telemetry data
                         try:
                             telemetry_callback(data)
                         except Exception as e:
                             logger.error(f"Error in telemetry callback: {e}")
+                    else:
+                        logger.debug(f"Data channel message received but no callback configured: {channel.label}")
                 else:
                     logger.warning("Received non-string message on data channel")
             except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse telemetry data: {e}")
+                logger.warning(f"Failed to parse data channel message: {e}")
             except Exception as e:
-                logger.error(f"Error handling telemetry: {e}")
+                logger.error(f"Error handling data channel message: {e}")
 
     async def offer(request):
         """Handle WebRTC SDP offer."""
@@ -237,6 +272,7 @@ class WebRTCReceiver:
         track_mapper: Optional[TrackMapper] = None,
         video_callback: Optional[Callable] = None,
         telemetry_callback: Optional[Callable] = None,
+        control_callback: Optional[Callable] = None,
     ):
         """
         Initialize WebRTC receiver.
@@ -248,11 +284,14 @@ class WebRTCReceiver:
                 Signature: callback(frame: np.ndarray, camera_type: str, timestamp: float)
             telemetry_callback: Optional callback for telemetry data
                 Signature: callback(data: dict)
+            control_callback: Optional callback for control commands
+                Signature: callback(command: dict)
         """
         self.port = port
         self.track_mapper = track_mapper or TrackMapper({"track_mappings": {}})
         self.video_callback = video_callback
         self.telemetry_callback = telemetry_callback
+        self.control_callback = control_callback
         
         # Initialize video queues for each camera type
         camera_types = self.track_mapper.get_all_camera_types()
@@ -273,6 +312,7 @@ class WebRTCReceiver:
                 self.track_mapper,
                 video_callback,
                 telemetry_callback,
+                control_callback,
                 self._ready,
             ),
             daemon=True,

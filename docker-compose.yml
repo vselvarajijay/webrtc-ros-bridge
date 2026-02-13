@@ -1,7 +1,10 @@
-# Global docker-compose: app-server, ros2-app-bridge, ros2_ws (ROS2 bridge), frodobots.
+# Global docker-compose: app-server, ros2-app-bridge, ros2_bridge (ROS2 nodes), frodobots.
 # Run from repo root: docker-compose up -d
 #
-# frodobots-earth-rovers service is defined below; ros2_bridge uses SDK_URL to reach it.
+# ROS2 nodes (in ros2_bridge):
+#   - frodobots_bridge: WebRTC -> /robot/video/front, /robot/video/rear, /robot/telemetry, /robot/control
+#   - occupancy_node:   /robot/video/front -> /occupancy/annotated_image, /occupancy/grid (floor segmentation + BEV)
+# ros2_bridge uses SDK_URL to reach frodobots; ros2_app_bridge subscribes to video + occupancy topics and POSTs to app_server.
 
 services:
   app_server:
@@ -10,13 +13,16 @@ services:
       dockerfile: Dockerfile
     container_name: app_server
     image: app-server:latest
+    restart: unless-stopped
     ports:
       - "8001:8001"
     environment:
       - ROS2_APP_BRIDGE_URL=http://ros2_app_bridge:9000
-      - FRODOBOTS_URL=http://frodobots:8000
+      # FRODOBOTS_URL removed - using WebRTC via ROS2 path only
     depends_on:
       - frodobots
+    mem_limit: 2g
+    mem_reservation: 512m
     networks:
       - webrtc_ros_network
 
@@ -37,6 +43,8 @@ services:
     networks:
       - webrtc_ros_network
 
+  # ROS2 Humble container: runs frodobots_bridge + occupancy_node (occupancy_system.launch.py).
+  # Rebuild after adding ROS2 packages: docker-compose build ros2_bridge
   ros2_bridge:
     build:
       context: ./ros2_ws
@@ -63,10 +71,11 @@ services:
       - frodobots
     stdin_open: true
     tty: true
+    # occupancy_system.launch.py starts: frodobots_bridge (video/telemetry/control) + occupancy_node (floor grid, BEV)
     command: >
       bash -c "source /opt/ros/humble/setup.bash
       && source /workspace/install/setup.bash
-      && ros2 launch frodobots_bridge frodobots_bridge.launch.py
+      && ros2 launch frodobots_bridge occupancy_system.launch.py
       sdk_url:=http://frodobots:8000"
     networks:
       - webrtc_ros_network
@@ -82,14 +91,15 @@ services:
     ports:
       - "8002:8000"   # Host 8002 to avoid conflict with other services on 8000
     environment:
-      - SDK_API_TOKEN=${SDK_API_TOKEN}
-      - BOT_SLUG=${BOT_SLUG}
+      # SDK_API_TOKEN and BOT_SLUG are loaded from env_file (.env)
+      # Override defaults for other variables if needed
       - MISSION_SLUG=${MISSION_SLUG:-}
       - CHROME_EXECUTABLE_PATH=/usr/bin/chromium
       - MAP_ZOOM_LEVEL=${MAP_ZOOM_LEVEL:-18}
       - IMAGE_FORMAT=${IMAGE_FORMAT:-png}
       - IMAGE_QUALITY=${IMAGE_QUALITY:-1.0}
       - DEBUG=${DEBUG:-false}
+      - WEBRTC_BRIDGE_URL=${WEBRTC_BRIDGE_URL:-http://ros2_bridge:8080}
     volumes:
       - ./frodobots-earth-rovers/screenshots:/app/screenshots:rw
     healthcheck:

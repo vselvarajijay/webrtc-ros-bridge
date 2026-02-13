@@ -17,6 +17,10 @@ frodobots_bridge:
     # Publishing settings
     publish_fps: 30.0
     
+    # HTTP Fallback Configuration - Use HTTP endpoints when WebRTC unavailable
+    use_http_fallback: true
+    http_fallback_endpoint: "/v2/front"
+    
     # WebRTC Configuration - Track mapping for camera identification
     # Maps SDK-specific track IDs to standardized camera types
     webrtc.track_mappings.front.track_id_contains: "1000"

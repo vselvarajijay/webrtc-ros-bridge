@@ -374,6 +374,7 @@ async def render_index_html(is_spectator: bool):
             checkpoints_list_data.get("checkpoints_list", [])
         ),
         "map_zoom_level": os.getenv("MAP_ZOOM_LEVEL", "18"),
+        "webrtc_bridge_url": os.getenv("WEBRTC_BRIDGE_URL", "http://ros2_bridge:8080"),
     }
 
     with open("index.html", "r", encoding="utf-8") as file:

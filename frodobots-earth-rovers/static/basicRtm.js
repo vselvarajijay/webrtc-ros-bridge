@@ -82,19 +82,38 @@ $(document).ready(function () {
     const message = JSON.stringify(json);
     console.warn("sending message to bot", botUid);
     console.warn("message", message);
-    rtmClient
-      .sendMessageToPeer(
-        {
-          text: message,
-        },
-        botUid
-      )
-      .then(() => {
-        console.warn("Message sent successfully:", message);
-      })
-      .catch((err) => {
-        console.warn("Error sending message:", err);
-      });
+    
+    // Forward via WebRTC data channel if available (preferred)
+    if (window.bridgeControlDataChannel && window.bridgeControlDataChannel.readyState === 'open') {
+      try {
+        // Forward control command to ROS2 Bridge via WebRTC data channel
+        window.bridgeControlDataChannel.send(message);
+        console.log("[WebRTC Bridge] Control command forwarded via WebRTC data channel");
+      } catch (error) {
+        console.error("[WebRTC Bridge] Failed to send via WebRTC data channel:", error);
+        // Fallback to RTM
+        forwardViaRTM();
+      }
+    } else {
+      // Fallback to RTM if WebRTC not available
+      forwardViaRTM();
+    }
+    
+    function forwardViaRTM() {
+      rtmClient
+        .sendMessageToPeer(
+          {
+            text: message,
+          },
+          botUid
+        )
+        .then(() => {
+          console.warn("Message sent successfully via RTM:", message);
+        })
+        .catch((err) => {
+          console.warn("Error sending message via RTM:", err);
+        });
+    }
   }
 
   // Make the function globally accessible

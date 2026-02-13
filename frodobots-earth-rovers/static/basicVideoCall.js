@@ -25,6 +25,11 @@ var localTracks = {
 var remoteUsers = {};
 
 /*
+ * WebRTC bridge peer connections for forwarding Agora tracks to ROS2 bridge
+ */
+var bridgePeerConnections = {};
+
+/*
  * Subscription queue to serialize subscribe calls (prevents WebRTC negotiation conflicts)
  */
 var subscriptionQueue = [];
@@ -271,6 +276,27 @@ async function leave() {
   isProcessingSubscription = false;
   $("#remote-playerlist").html("");
 
+  // Close all bridge peer connections
+  for (const uid in bridgePeerConnections) {
+    console.log(`[WebRTC Bridge] Closing bridge connection for UID ${uid}`);
+    const pc = bridgePeerConnections[uid];
+    
+    // Clean up video elements and canvas used for forwarding
+    pc.getSenders().forEach(sender => {
+      const track = sender.track;
+      if (track && track._sourceVideoElement) {
+        track._sourceVideoElement.pause();
+        track._sourceVideoElement.srcObject = null;
+        if (track._sourceVideoElement.parentNode) {
+          track._sourceVideoElement.parentNode.removeChild(track._sourceVideoElement);
+        }
+      }
+    });
+    
+    pc.close();
+  }
+  bridgePeerConnections = {};
+
   // leave the channel
   await client.leave();
   $("#local-player-name").text("");
@@ -333,6 +359,11 @@ async function processSubscriptionQueue() {
         }
 
         user.videoTrack.captureEnabled = true;
+        
+        // Forward video track to ROS2 bridge via WebRTC
+        forwardVideoTrackToBridge(user, uid).catch((error) => {
+          console.error(`Failed to forward video track for UID ${uid}:`, error);
+        });
       }
       if (mediaType === "audio") {
         user.audioTrack.play();
@@ -391,6 +422,30 @@ function handleUserUnpublished(user, mediaType) {
     const id = user.uid;
     delete remoteUsers[id];
     $(`#player-wrapper-${id}`).remove();
+    
+    // Close bridge peer connection if it exists
+    if (bridgePeerConnections[id]) {
+      console.log(`[WebRTC Bridge] Closing bridge connection for UID ${id}`);
+      const pc = bridgePeerConnections[id];
+      
+      // Clean up video elements and canvas used for forwarding
+      pc.getSenders().forEach(sender => {
+        const track = sender.track;
+        if (track && track._sourceVideoElement) {
+          track._sourceVideoElement.pause();
+          track._sourceVideoElement.srcObject = null;
+          if (track._sourceVideoElement.parentNode) {
+            track._sourceVideoElement.parentNode.removeChild(track._sourceVideoElement);
+          }
+        }
+        if (track && track._sourceCanvas) {
+          // Canvas cleanup handled by removing video element
+        }
+      });
+      
+      pc.close();
+      delete bridgePeerConnections[id];
+    }
   }
 }
 function getCodec() {
@@ -420,6 +475,223 @@ async function captureFrameAsBase64(videoTrack) {
 // Add at the beginning of the file
 const DEBUG_MODE = false;
 const lastBase64Frames = {};
+
+/*
+ * Forward Agora video track to ROS2 bridge via WebRTC
+ * @param {IAgoraRTCRemoteUser} user - The remote user with video track
+ * @param {number} uid - User ID (1000 = front, 1001 = rear)
+ */
+async function forwardVideoTrackToBridge(user, uid) {
+  // Check if bridge URL is configured
+  const bridgeUrl = window.webrtcBridgeUrl;
+  if (!bridgeUrl) {
+    console.log("WebRTC bridge URL not configured, skipping forwarding");
+    return;
+  }
+
+  // Check if connection already exists
+  if (bridgePeerConnections[uid]) {
+    console.log(`Bridge connection for UID ${uid} already exists`);
+    return;
+  }
+
+  // Only forward front (1000) and rear (1001) cameras
+  if (uid !== 1000 && uid !== 1001) {
+    console.log(`Skipping forwarding for UID ${uid} (only forwarding 1000 and 1001)`);
+    return;
+  }
+
+  if (!user.videoTrack) {
+    console.log(`No video track for UID ${uid}`);
+    return;
+  }
+
+  try {
+    console.log(`Starting WebRTC forwarding for UID ${uid} to bridge ${bridgeUrl}`);
+
+    // Create peer connection to bridge
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+
+    // Store connection
+    bridgePeerConnections[uid] = pc;
+    
+    // Create control data channel (only for front camera UID 1000)
+    let controlDataChannel = null;
+    if (uid === 1000) {
+      try {
+        controlDataChannel = pc.createDataChannel('control', {
+          ordered: true, // Ensure message ordering
+        });
+        
+        controlDataChannel.onopen = () => {
+          console.log(`[WebRTC Bridge] Control data channel opened for UID ${uid}`);
+        };
+        
+        controlDataChannel.onclose = () => {
+          console.log(`[WebRTC Bridge] Control data channel closed for UID ${uid}`);
+        };
+        
+        controlDataChannel.onerror = (error) => {
+          console.error(`[WebRTC Bridge] Control data channel error for UID ${uid}:`, error);
+        };
+        
+        // Store control data channel globally for interception
+        window.bridgeControlDataChannel = controlDataChannel;
+        
+        console.log(`[WebRTC Bridge] Control data channel created for UID ${uid}`);
+      } catch (error) {
+        console.error(`[WebRTC Bridge] Failed to create control data channel:`, error);
+      }
+    }
+
+    // Handle connection state changes
+    pc.onconnectionstatechange = () => {
+      const state = pc.connectionState;
+      console.log(`[WebRTC Bridge] Connection state for UID ${uid}: ${state}`);
+      if (state === 'connected') {
+        console.log(`[WebRTC Bridge] Successfully connected UID ${uid} video track to ROS2 bridge`);
+      } else if (state === 'failed' || state === 'closed') {
+        console.warn(`[WebRTC Bridge] Connection ${state} for UID ${uid}, cleaning up`);
+        delete bridgePeerConnections[uid];
+      } else if (state === 'disconnected') {
+        console.warn(`[WebRTC Bridge] Connection disconnected for UID ${uid}`);
+      }
+    };
+
+    // Handle ICE connection state
+    pc.oniceconnectionstatechange = () => {
+      const iceState = pc.iceConnectionState;
+      console.log(`[WebRTC Bridge] ICE connection state for UID ${uid}: ${iceState}`);
+      if (iceState === 'failed') {
+        console.error(`[WebRTC Bridge] ICE connection failed for UID ${uid}`);
+      } else if (iceState === 'connected' || iceState === 'completed') {
+        console.log(`[WebRTC Bridge] ICE connection ${iceState} for UID ${uid}`);
+      }
+    };
+    
+    // Handle ICE gathering state
+    pc.onicegatheringstatechange = () => {
+      console.log(`[WebRTC Bridge] ICE gathering state for UID ${uid}: ${pc.iceGatheringState}`);
+    };
+
+    // Forward the Agora video track to the bridge
+    // Try to use the Agora track directly first (it may already have the correct ID)
+    // If that doesn't work or isn't compatible, use canvas-based forwarding
+    let forwardedTrack;
+    let videoElement = null;
+    let canvas = null;
+    
+    // Check if Agora track ID contains the UID (for bridge identification)
+    const agoraTrackId = String(user.videoTrack.id || '');
+    const hasCorrectId = (uid === 1000 && agoraTrackId.includes('1000')) || 
+                         (uid === 1001 && agoraTrackId.includes('1001'));
+    
+    if (hasCorrectId) {
+      // Try to use Agora track directly - it may work if it's a standard MediaStreamTrack
+      try {
+        forwardedTrack = user.videoTrack;
+        console.log(`Using Agora track directly for UID ${uid} (ID: ${agoraTrackId})`);
+      } catch (error) {
+        console.warn('Failed to use Agora track directly, using canvas fallback:', error);
+        forwardedTrack = null;
+      }
+    }
+    
+    // If direct track doesn't work, use canvas-based forwarding
+    if (!forwardedTrack) {
+      console.log(`Using canvas-based forwarding for UID ${uid}`);
+      // Create a hidden video element to play the Agora track
+      videoElement = document.createElement('video');
+      videoElement.style.display = 'none';
+      videoElement.autoplay = true;
+      videoElement.playsInline = true;
+      videoElement.srcObject = new MediaStream([user.videoTrack]);
+      document.body.appendChild(videoElement);
+      
+      // Wait for video to be ready
+      await new Promise((resolve) => {
+        videoElement.onloadedmetadata = () => {
+          videoElement.play().then(resolve).catch(resolve);
+        };
+      });
+
+      // Create canvas to capture frames
+      canvas = document.createElement('canvas');
+      canvas.width = videoElement.videoWidth || 640;
+      canvas.height = videoElement.videoHeight || 480;
+      const ctx = canvas.getContext('2d');
+
+      // Capture stream from canvas (this creates a new track with a new ID)
+      const canvasStream = canvas.captureStream(30); // 30 FPS
+      forwardedTrack = canvasStream.getVideoTracks()[0];
+      
+      // Draw frames from video to canvas in a loop
+      const drawFrame = () => {
+        if (videoElement.readyState >= 2) { // HAVE_CURRENT_DATA
+          ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+        }
+        if (forwardedTrack.readyState === 'live') {
+          requestAnimationFrame(drawFrame);
+        }
+      };
+      drawFrame();
+
+      // Store video element and canvas for cleanup
+      forwardedTrack._sourceVideoElement = videoElement;
+      forwardedTrack._sourceCanvas = canvas;
+    }
+
+    // Create a stream with the forwarded track and add to peer connection
+    const stream = new MediaStream([forwardedTrack]);
+    pc.addTrack(forwardedTrack, stream);
+
+    // Create offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Send offer to bridge
+    const response = await fetch(`${bridgeUrl}/offer`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp,
+        type: pc.localDescription.type,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Bridge offer failed: ${response.status} ${response.statusText}`);
+    }
+
+    const answer = await response.json();
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+
+    console.log(`[WebRTC Bridge] SDP negotiation completed for UID ${uid}, waiting for ICE connection...`);
+  } catch (error) {
+    console.error(`[WebRTC Bridge] Error forwarding video track for UID ${uid} to bridge:`, error);
+    // Clean up on error
+    if (bridgePeerConnections[uid]) {
+      const pc = bridgePeerConnections[uid];
+      // Clean up video elements if they exist
+      pc.getSenders().forEach(sender => {
+        const track = sender.track;
+        if (track && track._sourceVideoElement) {
+          track._sourceVideoElement.pause();
+          track._sourceVideoElement.srcObject = null;
+          if (track._sourceVideoElement.parentNode) {
+            track._sourceVideoElement.parentNode.removeChild(track._sourceVideoElement);
+          }
+        }
+      });
+      pc.close();
+      delete bridgePeerConnections[uid];
+    }
+  }
+}
 
 // Function to get the latest base64 frame for a specific UID
 async function getLastBase64Frame(uid) {

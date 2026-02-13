@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime
+from fractions import Fraction
 from typing import Callable, List, Set
 
 import httpx
@@ -53,6 +54,11 @@ _last_frame_post_time: float = 0.0  # when we last received a frame from ros2_ap
 # WebRTC: pre-decoded BGR (updated once per POST) so track recv() doesn't decode every time → lower latency
 latest_front_bgr: "np.ndarray | None" = None
 
+# Occupancy stream: annotated video (floor overlay + BEV) from ros2_app_bridge
+latest_occupancy_bgr: "np.ndarray | None" = None
+video_stream_subscribers_occupancy: List[asyncio.Queue[bytes]] = []
+_last_occupancy_frame_time: float | None = None  # monotonic time when we last received a frame
+
 # Minimal 1x1 gray JPEG so stream always sends something before first real frame
 _PLACEHOLDER_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/2gAMAwEAAhEDEQA/ALJ//9k="
@@ -64,10 +70,29 @@ ROS2_APP_BRIDGE_URL = os.environ.get("ROS2_APP_BRIDGE_URL", "http://ros2_app_bri
 FRODOBOTS_URL = os.environ.get("FRODOBOTS_URL", "").rstrip("/")
 _last_control_forward_warning_time: float = 0.0
 CONTROL_FORWARD_WARNING_INTERVAL = 10.0  # log at most once per 10s when bridge unreachable
-VIDEO_FALLBACK_INTERVAL = 0.15  # fetch from Frodobots every 150ms (~6–7 FPS) when fallback enabled
+def _video_fallback_interval() -> float:
+    """Fetch interval in seconds; env VIDEO_FALLBACK_INTERVAL overrides (e.g. 0.033 for 30 FPS)."""
+    v = os.environ.get("VIDEO_FALLBACK_INTERVAL")
+    if v:
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return 0.033  # ~30 FPS default for real-time streaming
+VIDEO_FALLBACK_INTERVAL = _video_fallback_interval()
 
 # WebRTC: peer connections for cleanup on shutdown
 webrtc_pcs: Set = set()
+
+# WebRTC: data channel references keyed by peer connection
+webrtc_data_channels: dict = {}
+
+# WebRTC: ROS2 App Bridge peer connections (for forwarding video and control)
+ros2_bridge_pcs: dict = {}  # Key: "front" or "occupancy", Value: RTCPeerConnection
+ros2_bridge_data_channels: dict = {}  # Key: RTCPeerConnection, Value: RTCDataChannel
+
+# WebRTC statistics tracking
+_webrtc_stats = {"webrtc_messages": 0, "http_requests": 0}
 
 # Reused HTTP client for control forwarding (keep-alive, low latency)
 _control_http_client: httpx.AsyncClient | None = None
@@ -113,7 +138,8 @@ if HAS_WEBRTC:
             super().__init__()
             self._get_latest_bgr = get_latest_bgr
             self._pts = 0
-            self._time_base = 1 / 30
+            # time_base must be a Fraction, not a float
+            self._time_base = Fraction(1, 30)
 
         async def recv(self):
             bgr = self._get_latest_bgr()
@@ -167,12 +193,17 @@ async def _video_fallback_loop() -> None:
                     continue
                 raw = base64.b64decode(b64)
                 jpeg = _raw_image_to_jpeg(raw)
-                global latest_front_jpeg
+                global latest_front_jpeg, latest_front_bgr
                 # Prefer ROS2 path: skip fallback update if we got a frame from bridge recently
                 if time.monotonic() - _last_frame_post_time < 2.0:
                     await asyncio.sleep(VIDEO_FALLBACK_INTERVAL)
                     continue
                 latest_front_jpeg = jpeg
+                # Feed WebRTC track when aiortc is available so browser gets real-time frames
+                if HAS_WEBRTC:
+                    result = _jpeg_to_bgr24(jpeg)
+                    if result:
+                        latest_front_bgr = result[0].copy()
                 chunk = _mjpeg_chunk(jpeg)
                 dead: List[int] = []
                 for i, q in enumerate(video_stream_subscribers):
@@ -233,10 +264,24 @@ class ControlBody(BaseModel):
 _video_fallback_task: asyncio.Task | None = None
 
 
+def _asyncio_exception_handler(loop, context):
+    """Log asyncio exceptions; suppress noisy aioice STUN InvalidStateError."""
+    exc = context.get("exception")
+    if exc is not None and isinstance(exc, asyncio.InvalidStateError):
+        msg = context.get("message", "")
+        handle_str = str(context.get("handle", ""))
+        if "Transaction" in msg or "stun" in msg or "Transaction" in handle_str or "__retry" in handle_str:
+            logger.debug("aioice STUN retry race (ignored): %s", msg or handle_str)
+            return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _video_fallback_task, _control_http_client
     logger.info("App-server starting (pure FastAPI, no ROS2)")
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_asyncio_exception_handler)
     _control_http_client = httpx.AsyncClient(timeout=2.0)
     if FRODOBOTS_URL:
         _video_fallback_task = asyncio.create_task(_video_fallback_loop())
@@ -341,8 +386,18 @@ async def video_frame_raw(request: Request):
     expected = h * w * 3
     if len(body) != expected:
         return {"ok": False, "error": f"body length {len(body)} != {expected}"}
+    
+    # Log first frame and every 30th frame to reduce spam
+    if not hasattr(video_frame_raw, '_frame_count'):
+        video_frame_raw._frame_count = 0
+    video_frame_raw._frame_count += 1
+    if video_frame_raw._frame_count == 1 or video_frame_raw._frame_count % 30 == 0:
+        logger.info(f"Received front camera frame #{video_frame_raw._frame_count} via HTTP: {w}x{h}, size={len(body)} bytes")
+    
     arr = np.frombuffer(body, dtype=np.uint8).reshape((h, w, 3)).copy()
     latest_front_bgr = arr
+    
+    # Send to MJPEG subscribers
     if video_stream_subscribers:
         jpeg = _bgr_to_jpeg(arr)
         if jpeg:
@@ -355,6 +410,60 @@ async def video_frame_raw(request: Request):
                     dead.append(i)
             for i in reversed(dead):
                 video_stream_subscribers.pop(i)
+            if video_frame_raw._frame_count == 1 or video_frame_raw._frame_count % 30 == 0:
+                logger.info(f"Sent frame #{video_frame_raw._frame_count} to {len(video_stream_subscribers)} MJPEG subscribers")
+    else:
+        if video_frame_raw._frame_count == 1 or video_frame_raw._frame_count % 30 == 0:
+            logger.debug("Frame #%s received but no MJPEG subscribers (client may connect later)", video_frame_raw._frame_count)
+    
+    return {"ok": True}
+
+
+@app.post("/api/video/occupancy/frame/raw")
+async def video_occupancy_frame_raw(request: Request):
+    """Accept raw BGR bytes from ros2_app_bridge (occupancy annotated image)."""
+    global latest_occupancy_bgr, _last_occupancy_frame_time
+    _last_occupancy_frame_time = time.monotonic()
+    body = await request.body()
+    width = request.headers.get("X-Width")
+    height = request.headers.get("X-Height")
+    if not body or not width or not height:
+        return {"ok": False, "error": "empty body or missing X-Width/X-Height"}
+    try:
+        w, h = int(width), int(height)
+    except ValueError:
+        return {"ok": False, "error": "invalid X-Width or X-Height"}
+    expected = h * w * 3
+    if len(body) != expected:
+        return {"ok": False, "error": f"body length {len(body)} != {expected}"}
+    # Log first frame and every 30th frame to reduce spam
+    if not hasattr(video_occupancy_frame_raw, '_frame_count'):
+        video_occupancy_frame_raw._frame_count = 0
+    video_occupancy_frame_raw._frame_count += 1
+    if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
+        logger.info(f"Received occupancy frame #{video_occupancy_frame_raw._frame_count} via HTTP: {w}x{h}, size={len(body)} bytes")
+    arr = np.frombuffer(body, dtype=np.uint8).reshape((h, w, 3)).copy()
+    latest_occupancy_bgr = arr
+    
+    # Send to MJPEG subscribers
+    if video_stream_subscribers_occupancy:
+        jpeg = _bgr_to_jpeg(arr)
+        if jpeg:
+            chunk = _mjpeg_chunk(jpeg)
+            dead: List[int] = []
+            for i, q in enumerate(video_stream_subscribers_occupancy):
+                try:
+                    q.put_nowait(chunk)
+                except Exception:
+                    dead.append(i)
+            for i in reversed(dead):
+                video_stream_subscribers_occupancy.pop(i)
+            if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
+                logger.info(f"Sent occupancy frame #{video_occupancy_frame_raw._frame_count} to {len(video_stream_subscribers_occupancy)} MJPEG subscribers")
+    else:
+        if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
+            logger.debug("Occupancy frame #%s received but no MJPEG subscribers (client may connect later)", video_occupancy_frame_raw._frame_count)
+    
     return {"ok": True}
 
 
@@ -366,6 +475,12 @@ async def _stream_generator(client_queue: asyncio.Queue[bytes]) -> bytes:
     finally:
         try:
             video_stream_subscribers.remove(client_queue)
+            # Clear any remaining items in the queue to free memory
+            while not client_queue.empty():
+                try:
+                    client_queue.get_nowait()
+                except Exception:
+                    break
         except ValueError:
             pass
 
@@ -373,14 +488,21 @@ async def _stream_generator(client_queue: asyncio.Queue[bytes]) -> bytes:
 @app.get("/api/video/front/stream")
 async def video_front_stream():
     """Long-lived MJPEG stream: server pushes frames to the client."""
-    client_queue: asyncio.Queue[bytes] = asyncio.Queue()
+    logger.info("MJPEG stream client connected for front camera")
+    # Limit queue size to prevent memory buildup (max 5 frames buffered per client)
+    client_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=5)
     video_stream_subscribers.append(client_queue)
+    logger.info(f"Total MJPEG subscribers: {len(video_stream_subscribers)}")
+    
     if latest_front_bgr is not None:
+        logger.info("Using latest_front_bgr for initial frame")
         initial = _bgr_to_jpeg(latest_front_bgr)
         initial = _mjpeg_chunk(initial) if initial else _mjpeg_chunk(_PLACEHOLDER_JPEG)
     elif latest_front_jpeg is not None:
+        logger.info("Using latest_front_jpeg for initial frame")
         initial = _mjpeg_chunk(latest_front_jpeg)
     else:
+        logger.warning("No video frames available - sending placeholder")
         initial = _mjpeg_chunk(_PLACEHOLDER_JPEG)
     try:
         client_queue.put_nowait(initial)
@@ -390,6 +512,54 @@ async def video_front_stream():
         _stream_generator(client_queue),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+async def _occupancy_stream_generator(client_queue: asyncio.Queue[bytes]) -> bytes:
+    """Yield MJPEG chunks for occupancy stream until client disconnects; remove queue on exit."""
+    try:
+        while True:
+            yield await client_queue.get()
+    finally:
+        try:
+            video_stream_subscribers_occupancy.remove(client_queue)
+            # Clear any remaining items in the queue to free memory
+            while not client_queue.empty():
+                try:
+                    client_queue.get_nowait()
+                except Exception:
+                    break
+        except ValueError:
+            pass
+
+
+@app.get("/api/video/occupancy/stream")
+async def video_occupancy_stream():
+    """Long-lived MJPEG stream: occupancy annotated video (floor overlay + BEV)."""
+    # Limit queue size to prevent memory buildup (max 5 frames buffered per client)
+    client_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=5)
+    video_stream_subscribers_occupancy.append(client_queue)
+    if latest_occupancy_bgr is not None:
+        initial = _bgr_to_jpeg(latest_occupancy_bgr)
+        initial = _mjpeg_chunk(initial) if initial else _mjpeg_chunk(_PLACEHOLDER_JPEG)
+    else:
+        initial = _mjpeg_chunk(_PLACEHOLDER_JPEG)
+    try:
+        client_queue.put_nowait(initial)
+    except Exception:
+        pass
+    return StreamingResponse(
+        _occupancy_stream_generator(client_queue),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/api/occupancy/status")
+async def occupancy_status():
+    """Return whether occupancy frames have been received (for UI waiting state)."""
+    return {
+        "received_frames": latest_occupancy_bgr is not None,
+        "last_frame_at": _last_occupancy_frame_time,
+    }
 
 
 # --- WebRTC signaling (true low-latency video) ---
@@ -411,49 +581,323 @@ async def webrtc_offer(body: WebRTCOfferBody):
     pc = RTCPeerConnection()
     webrtc_pcs.add(pc)
 
+    # Log SDP to check for data channel and video info
+    sdp_lines = body.sdp.split('\n')
+    has_data_channel = any('m=application' in line for line in sdp_lines)
+    has_video = any('m=video' in line for line in sdp_lines)
+    logger.info("WebRTC offer received - SDP contains data channel: %s, video: %s", has_data_channel, has_video)
+    if has_data_channel:
+        logger.debug("SDP data channel lines: %s", [line for line in sdp_lines if 'm=application' in line or 'sctp' in line.lower()])
+    if has_video:
+        video_lines = [line for line in sdp_lines if 'm=video' in line or ('a=sendrecv' in line or 'a=recvonly' in line or 'a=sendonly' in line)]
+        logger.debug("SDP video lines: %s", video_lines[:5])  # First 5 video-related lines
+
     def get_latest_bgr():
         return latest_front_bgr
 
-    track = LiveFrameTrack(get_latest_bgr)
-    pc.addTrack(track)
+    # Only add video track if offer includes video media line
+    # Frontend offers may only include data channel, in which case video will use HTTP/MJPEG fallback
+    if has_video:
+        track = LiveFrameTrack(get_latest_bgr)
+        pc.addTrack(track)
+        logger.info("WebRTC front camera track added to peer connection (offer includes video)")
+    else:
+        logger.info("WebRTC offer has no video - video will use HTTP/MJPEG fallback")
 
+    @pc.on("track")
+    def on_track(track):
+        logger.info("WebRTC front camera: remote track received: %s", track.kind)
+
+    # Register data channel handler BEFORE setRemoteDescription
     @pc.on("datachannel")
     def on_datachannel(channel: RTCDataChannel):
+        logger.info("WebRTC data channel received: label=%s, id=%s, readyState=%s", 
+                   channel.label, getattr(channel, 'id', 'N/A'), getattr(channel, 'readyState', 'N/A'))
+        
         if channel.label == "control":
+            # Store reference in dictionary keyed by peer connection
+            webrtc_data_channels[pc] = channel
+            logger.info("WebRTC control data channel stored for peer connection")
+            
+            @channel.on("open")
+            def on_open():
+                logger.info("WebRTC control data channel opened successfully")
+                webrtc_data_channels[pc] = channel  # Ensure it's stored
+            
+            @channel.on("close")
+            def on_close():
+                logger.warning("WebRTC control data channel closed")
+                if pc in webrtc_data_channels:
+                    del webrtc_data_channels[pc]
+            
+            @channel.on("error")
+            def on_error(error):
+                logger.error("WebRTC control data channel error: %s", error)
+            
             @channel.on("message")
             def on_message(message):
                 try:
+                    logger.debug("WebRTC control message received: %s", message[:100] if isinstance(message, str) else type(message))
                     if isinstance(message, str):
                         data = json.loads(message)
                         cmd = data.get("command")
                         if isinstance(cmd, dict):
+                            logger.info("WebRTC control command received: linear=%.2f, angular=%.2f, lamp=%d", 
+                                       cmd.get("linear", 0), cmd.get("angular", 0), cmd.get("lamp", 0))
+                            _webrtc_stats["webrtc_messages"] += 1
                             asyncio.create_task(_forward_control_to_bridge(cmd))
-                except (json.JSONDecodeError, TypeError) as e:
-                    logger.debug("WebRTC control message parse error: %s", e)
+                        else:
+                            logger.warning("WebRTC control message missing 'command' field")
+                    else:
+                        logger.warning("WebRTC control message is not a string: %s", type(message))
+                except json.JSONDecodeError as e:
+                    logger.error("WebRTC control message JSON parse error: %s", e)
+                except TypeError as e:
+                    logger.error("WebRTC control message type error: %s", e)
+                except Exception as e:
+                    logger.error("WebRTC control message handling error: %s", e)
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        if pc.connectionState in ("failed", "closed", "disconnected"):
+        state = pc.connectionState
+        logger.info("WebRTC peer connection state changed: %s", state)
+        if state in ("failed", "closed", "disconnected"):
+            logger.warning("WebRTC peer connection %s, cleaning up", state)
+            # Clean up data channel reference
+            if pc in webrtc_data_channels:
+                del webrtc_data_channels[pc]
+            webrtc_pcs.discard(pc)
+            await pc.close()
+        elif state == "connected":
+            # Check data channel state when connection is established
+            if pc in webrtc_data_channels:
+                dc = webrtc_data_channels[pc]
+                logger.info("WebRTC connection established - data channel state: %s", getattr(dc, 'readyState', 'unknown'))
+            else:
+                logger.warning("WebRTC connection established but no data channel found")
+
+    try:
+        logger.info("Setting remote description (data channel handler registered)...")
+        await pc.setRemoteDescription(offer)
+        
+        # Check if data channel was received after setRemoteDescription
+        # In aiortc, the datachannel event may fire synchronously during setRemoteDescription
+        if pc in webrtc_data_channels:
+            logger.info("Data channel found after setRemoteDescription: %s", webrtc_data_channels[pc].label)
+        else:
+            logger.warning("No data channel found after setRemoteDescription - checking SDP again")
+            # Check SDP for data channel info
+            local_sdp = offer.sdp if offer and hasattr(offer, 'sdp') and offer.sdp else None
+            if local_sdp and 'm=application' in local_sdp:
+                logger.info("SDP contains application media line - data channel should be negotiated")
+            else:
+                logger.warning("SDP does not contain application media line - data channel may not be in offer")
+        
+        answer = await pc.createAnswer()
+        if not answer or not hasattr(answer, 'sdp') or not answer.sdp:
+            raise ValueError("createAnswer() returned invalid answer - missing SDP")
+        await pc.setLocalDescription(answer)
+        
+        # Log answer SDP to verify data channel is included
+        if answer.sdp:
+            answer_sdp_lines = answer.sdp.split('\n')
+            answer_has_data_channel = any('m=application' in line for line in answer_sdp_lines)
+            logger.info("WebRTC answer created - SDP contains data channel: %s", answer_has_data_channel)
+        else:
+            logger.warning("WebRTC answer created but SDP is empty")
+        
+        if not pc.localDescription or not pc.localDescription.sdp:
+            raise ValueError("Failed to create local description - missing SDP")
+        
+        return {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+    except Exception as e:
+        logger.error("WebRTC offer failed: %s", e, exc_info=True)
+        # Clean up data channel reference on error
+        if pc in webrtc_data_channels:
+            del webrtc_data_channels[pc]
+        webrtc_pcs.discard(pc)
+        await pc.close()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/api/webrtc/occupancy/offer")
+async def webrtc_occupancy_offer(body: WebRTCOfferBody):
+    """Accept SDP offer for occupancy stream; return SDP answer with single video track (annotated floor overlay)."""
+    if not HAS_WEBRTC:
+        return JSONResponse(
+            content={"error": "WebRTC not available (install aiortc, av, numpy)"},
+            status_code=503,
+        )
+    offer = RTCSessionDescription(sdp=body.sdp, type=body.type)
+    pc = RTCPeerConnection()
+    webrtc_pcs.add(pc)
+
+    def get_latest_occupancy_bgr():
+        return latest_occupancy_bgr
+
+    # Check if offer has video before adding track
+    sdp_lines = body.sdp.split('\n') if body.sdp else []
+    has_video = any('m=video' in line for line in sdp_lines)
+    
+    if has_video:
+        track = LiveFrameTrack(get_latest_occupancy_bgr)
+        pc.addTrack(track)
+        logger.info("WebRTC occupancy track added to peer connection (offer includes video)")
+    else:
+        logger.info("WebRTC occupancy offer has no video - will use HTTP/MJPEG fallback")
+
+    @pc.on("track")
+    def on_track(track):
+        logger.info("WebRTC occupancy: remote track received: %s", track.kind)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        state = pc.connectionState
+        logger.info("WebRTC occupancy peer connection state changed: %s", state)
+        if state in ("failed", "closed", "disconnected"):
+            logger.warning("WebRTC occupancy peer connection %s, cleaning up", state)
             webrtc_pcs.discard(pc)
             await pc.close()
 
     try:
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()
+        if not answer or not hasattr(answer, 'sdp') or not answer.sdp:
+            raise ValueError("createAnswer() returned invalid answer - missing SDP")
         await pc.setLocalDescription(answer)
+        
+        # Log answer SDP to verify data channel is included
+        if answer.sdp:
+            answer_sdp_lines = answer.sdp.split('\n')
+            answer_has_data_channel = any('m=application' in line for line in answer_sdp_lines)
+            logger.info("WebRTC occupancy answer created - SDP contains data channel: %s", answer_has_data_channel)
+        
+        if not pc.localDescription or not pc.localDescription.sdp:
+            raise ValueError("Failed to create local description - missing SDP")
+        
         return {
             "sdp": pc.localDescription.sdp,
             "type": pc.localDescription.type,
         }
     except Exception as e:
-        logger.warning("WebRTC offer failed: %s", e)
+        logger.error("WebRTC occupancy offer failed: %s", e, exc_info=True)
         webrtc_pcs.discard(pc)
         await pc.close()
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+@app.post("/api/webrtc/ros2-bridge/offer")
+async def webrtc_ros2_bridge_offer(body: WebRTCOfferBody):
+    """Accept SDP offer from ROS2 App Bridge for video and control forwarding."""
+    if not HAS_WEBRTC:
+        return JSONResponse(
+            content={"error": "WebRTC not available (install aiortc, av, numpy)"},
+            status_code=503,
+        )
+    
+    offer = RTCSessionDescription(sdp=body.sdp, type=body.type)
+    pc = RTCPeerConnection()
+    
+    # Determine stream type from SDP or use a parameter (for now, we'll detect from tracks)
+    stream_type = "front"  # Default, will be updated when track is received
+    
+    logger.info("WebRTC ROS2 Bridge offer received for stream type: %s", stream_type)
+    
+    # Store peer connection
+    ros2_bridge_pcs[stream_type] = pc
+    
+    # Handle incoming video tracks from ROS2 App Bridge
+    @pc.on("track")
+    def on_track(track):
+        if track.kind == "video":
+            track_label = getattr(track, 'label', None) or getattr(track, 'id', 'unknown')
+            logger.info("WebRTC ROS2 Bridge video track received: %s", track_label)
+            # Update latest BGR frame from ROS2 Bridge
+            # We'll need to extract frames from the track and update latest_front_bgr or latest_occupancy_bgr
+            # For now, log that we received it
+            # TODO: Extract frames from track and update latest_front_bgr/latest_occupancy_bgr
+    
+    # Handle data channel for control commands
+    @pc.on("datachannel")
+    def on_datachannel(channel: RTCDataChannel):
+        logger.info("WebRTC ROS2 Bridge data channel received: label=%s", channel.label)
+        
+        if channel.label == "control":
+            ros2_bridge_data_channels[pc] = channel
+            
+            @channel.on("open")
+            def on_open():
+                logger.info("WebRTC ROS2 Bridge control data channel opened successfully")
+            
+            @channel.on("close")
+            def on_close():
+                logger.warning("WebRTC ROS2 Bridge control data channel closed")
+                if pc in ros2_bridge_data_channels:
+                    del ros2_bridge_data_channels[pc]
+            
+            @channel.on("error")
+            def on_error(error):
+                logger.error("WebRTC ROS2 Bridge control data channel error: %s", error)
+            
+            @channel.on("message")
+            def on_message(message):
+                # Control commands from ROS2 Bridge (if bidirectional needed)
+                logger.debug("WebRTC ROS2 Bridge control message received: %s", message[:100] if isinstance(message, str) else type(message))
+    
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        state = pc.connectionState
+        logger.info("WebRTC ROS2 Bridge peer connection state changed: %s", state)
+        if state in ("failed", "closed", "disconnected"):
+            logger.warning("WebRTC ROS2 Bridge peer connection %s, cleaning up", state)
+            if pc in ros2_bridge_data_channels:
+                del ros2_bridge_data_channels[pc]
+            if stream_type in ros2_bridge_pcs:
+                del ros2_bridge_pcs[stream_type]
+            await pc.close()
+    
+    try:
+        await pc.setRemoteDescription(offer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        logger.info("WebRTC ROS2 Bridge connection established")
+        return {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+    except Exception as e:
+        logger.warning("WebRTC ROS2 Bridge offer failed: %s", e)
+        if stream_type in ros2_bridge_pcs:
+            del ros2_bridge_pcs[stream_type]
+        if pc in ros2_bridge_data_channels:
+            del ros2_bridge_data_channels[pc]
+        await pc.close()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
 async def _forward_control_to_bridge(cmd: dict) -> bool:
-    """Forward control command to ros2-app-bridge (async). Reuses shared client for low latency."""
+    """
+    Forward control command to ros2-app-bridge via WebRTC data channel (preferred) or HTTP (fallback).
+    
+    WebRTC is the primary method for low-latency control. HTTP is kept as a fallback for debugging
+    and compatibility when WebRTC is not available.
+    """
+    # Try WebRTC data channel first
+    for pc, dc in ros2_bridge_data_channels.items():
+        if dc.readyState == "open":
+            try:
+                message = json.dumps({"command": cmd})
+                dc.send(message)
+                logger.debug("Control command forwarded via WebRTC data channel to ROS2 Bridge")
+                return True
+            except Exception as e:
+                logger.warning("Failed to send via WebRTC data channel: %s, falling back to HTTP", e)
+                break
+    
+    # Fallback to HTTP
     url = f"{ROS2_APP_BRIDGE_URL}/control"
     client = _control_http_client
     if client is None:
@@ -477,7 +921,10 @@ async def _forward_control_to_bridge(cmd: dict) -> bool:
 
 @app.post("/api/control")
 def control(body: ControlBody):
-    """Forward control command to ros2-app-bridge (publishes to /robot/control)."""
+    """Forward control command to ros2-app-bridge (publishes to /robot/control). HTTP fallback endpoint."""
+    _webrtc_stats["http_requests"] += 1
+    logger.info("HTTP control command received (fallback): linear=%.2f, angular=%.2f, lamp=%d", 
+               body.command.linear, body.command.angular, body.command.lamp)
     cmd = {
         "linear": body.command.linear,
         "angular": body.command.angular,
@@ -511,6 +958,32 @@ def control(body: ControlBody):
             )
             _last_control_forward_warning_time = now
         return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
+
+
+@app.get("/api/webrtc/status")
+def webrtc_status():
+    """Get WebRTC connection status and statistics."""
+    active_connections_count = len(webrtc_pcs)
+    connections_info = []
+    for pc in list(webrtc_pcs):
+        connections_info.append({
+            "connection_state": pc.connectionState,
+            "ice_connection_state": pc.iceConnectionState,
+            "ice_gathering_state": pc.iceGatheringState,
+        })
+    
+    return {
+        "active_peer_connections": active_connections_count,
+        "connections": connections_info,
+        "statistics": {
+            "webrtc_messages": _webrtc_stats["webrtc_messages"],
+            "http_requests": _webrtc_stats["http_requests"],
+            "total": _webrtc_stats["webrtc_messages"] + _webrtc_stats["http_requests"],
+        },
+        "webrtc_usage_percentage": (
+            (_webrtc_stats["webrtc_messages"] / max(1, _webrtc_stats["webrtc_messages"] + _webrtc_stats["http_requests"])) * 100
+        ) if (_webrtc_stats["webrtc_messages"] + _webrtc_stats["http_requests"]) > 0 else 0,
+    }
 
 
 @app.websocket("/ws")
