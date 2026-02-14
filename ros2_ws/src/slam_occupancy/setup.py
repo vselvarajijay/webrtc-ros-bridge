@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = "wander_planning"
+package_name = "slam_occupancy"
 
 setup(
     name=package_name,
@@ -10,16 +10,15 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "numpy"],
     zip_safe=True,
     maintainer="dgx-ros2",
     maintainer_email="user@example.com",
-    description="Reactive wander + obstacle avoid from occupancy grid; publishes to /robot/control",
+    description="Occupancy grid from SLAM map points (ground plane + obstacles)",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "wander_node = wander_planning.wander_node:main",
-            "frontier_node = wander_planning.frontier_node:main",
+            "slam_occupancy_node = slam_occupancy.slam_occupancy_node:main",
         ],
     },
 )

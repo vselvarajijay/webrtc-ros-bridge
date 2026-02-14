@@ -23,7 +23,10 @@ interface LogMessage {
   type: string
 }
 
-const API_BASE = 'http://localhost:8001'
+// Use env override or same host as the app with port 8001 so it works from any machine (e.g. Docker host)
+const API_BASE =
+  (typeof import.meta !== 'undefined' && (import.meta as { env?: { VITE_API_URL?: string } }).env?.VITE_API_URL) ||
+  (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8001` : 'http://localhost:8001')
 
 interface DriveState {
   linear: number
@@ -43,26 +46,16 @@ function App() {
   const [controlStatus, setControlStatus] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle')
   const [driveState, setDriveState] = useState<DriveState>({ linear: 0, angular: 0, lamp: 0 })
   const [videoError, setVideoError] = useState(false)
-  const [videoMode, setVideoMode] = useState<'webrtc' | 'mjpeg'>('webrtc')
-  const [videoErrorOccupancy, setVideoErrorOccupancy] = useState(false)
-  const [videoModeOccupancy, setVideoModeOccupancy] = useState<'webrtc' | 'mjpeg'>('webrtc')
-  const [occupancyReceivedFrames, setOccupancyReceivedFrames] = useState(false)
+  const [videoMode, setVideoMode] = useState<'webrtc' | 'mjpeg'>('mjpeg')
   const [controlMethod, setControlMethod] = useState<'webrtc' | 'http' | 'connecting'>('connecting')
   const [webrtcConnectionState, setWebrtcConnectionState] = useState<string>('new')
-  const [wanderActive, setWanderActive] = useState(false)
-  const [wanderLoading, setWanderLoading] = useState(false)
-  const [mapData, setMapData] = useState<{ width: number; height: number; resolution: number; origin: { x: number; y: number }; data: number[] } | null>(null)
-  const [robotPose, setRobotPose] = useState<{ x: number; y: number; theta: number } | null>(null)
-  const mapCanvasRef = useRef<HTMLCanvasElement>(null)
   const driveRef = useRef<DriveState>({ linear: 0, angular: 0, lamp: 0 })
   const keysPressedRef = useRef<Set<string>>(new Set()) // Track which keys are currently pressed
   const lastKeyEventRef = useRef<number>(0) // For safety: force stop if keyup missed (e.g. focus loss)
   const wsRef = useRef<WebSocket | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
-  const videoRefOccupancy = useRef<HTMLVideoElement>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
-  const pcOccupancyRef = useRef<RTCPeerConnection | null>(null)
   const dataChannelRef = useRef<RTCDataChannel | null>(null)
   const httpFallbackTimeoutRef = useRef<number | null>(null)
   const webrtcStatsRef = useRef<{ webrtc: number; http: number }>({ webrtc: 0, http: 0 })
@@ -71,7 +64,7 @@ function App() {
     const payload = { command: { linear, angular, lamp } }
     const dc = dataChannelRef.current
     
-    // Prioritize WebRTC data channel if it's open
+    // Use WebRTC only when data channel is actually open; otherwise use HTTP so commands always get through
     if (dc?.readyState === 'open') {
       try {
         dc.send(JSON.stringify(payload))
@@ -87,19 +80,7 @@ function App() {
       }
     }
     
-    // Fallback to HTTP only if WebRTC is not available or failed
-    // Use exponential backoff to avoid spamming HTTP if WebRTC is preferred
-    if (controlMethod === 'webrtc' && dc?.readyState !== 'closed') {
-      // WebRTC was working but temporarily unavailable, wait a bit before falling back
-      if (!httpFallbackTimeoutRef.current) {
-        httpFallbackTimeoutRef.current = window.setTimeout(() => {
-          httpFallbackTimeoutRef.current = null
-        }, 100)
-        return // Skip this command, will retry next interval
-      }
-    }
-    
-    // HTTP fallback
+    // HTTP fallback whenever WebRTC data channel is not open (connecting, closing, closed, or null)
     fetch(`${API_BASE}/api/control`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -203,109 +184,6 @@ function App() {
     // Auto-scroll to bottom when new logs arrive
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [logs])
-
-  // Poll occupancy status so we can show "Waiting for stream..." when no frames yet
-  useEffect(() => {
-    const check = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/occupancy/status`)
-        if (res.ok) {
-          const data = await res.json()
-          setOccupancyReceivedFrames(Boolean(data.received_frames))
-        }
-      } catch {
-        // ignore
-      }
-    }
-    check()
-    const id = setInterval(check, 2000)
-    return () => clearInterval(id)
-  }, [])
-
-  // Poll map and robot pose for Map card
-  useEffect(() => {
-    const fetchMapAndPose = async () => {
-      try {
-        const [mapRes, poseRes] = await Promise.all([
-          fetch(`${API_BASE}/api/map`),
-          fetch(`${API_BASE}/api/robot_pose`),
-        ])
-        if (mapRes.ok) {
-          const data = await mapRes.json()
-          setMapData(data)
-        } else {
-          setMapData(null)
-        }
-        if (poseRes.ok) {
-          const data = await poseRes.json()
-          setRobotPose(data)
-        } else {
-          setRobotPose(null)
-        }
-      } catch {
-        setMapData(null)
-        setRobotPose(null)
-      }
-    }
-    fetchMapAndPose()
-    const id = setInterval(fetchMapAndPose, 1500)
-    return () => clearInterval(id)
-  }, [])
-
-  // Draw map and robot on canvas when data changes
-  useEffect(() => {
-    const canvas = mapCanvasRef.current
-    if (!canvas || !mapData) return
-    const { width: w, height: h, resolution, origin, data } = mapData
-    if (w < 1 || h < 1) return
-    const dpr = window.devicePixelRatio || 1
-    const displayW = 400
-    const displayH = 400
-    const scale = Math.min(displayW / w, displayH / h)
-    canvas.width = displayW * dpr
-    canvas.height = displayH * dpr
-    canvas.style.width = `${displayW}px`
-    canvas.style.height = `${displayH}px`
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
-    ctx.setTransform(1, 0, 0, 1, 0, 0)
-    ctx.scale(dpr, dpr)
-    ctx.fillStyle = '#2d2d2d'
-    ctx.fillRect(0, 0, displayW, displayH)
-    const cellW = scale
-    const cellH = scale
-    for (let row = 0; row < h; row++) {
-      for (let col = 0; col < w; col++) {
-        const v = data[row * w + col]
-        if (v === 0) ctx.fillStyle = '#4ade80'
-        else if (v === 100) ctx.fillStyle = '#404040'
-        else ctx.fillStyle = '#6b7280'
-        ctx.fillRect(col * scale, row * scale, Math.ceil(cellW), Math.ceil(cellH))
-      }
-    }
-    if (robotPose) {
-      const px = (robotPose.x - origin.x) / resolution
-      const py = (robotPose.y - origin.y) / resolution
-      const cx = px * scale
-      const cy = py * scale
-      const len = 8
-      const t = robotPose.theta
-      ctx.save()
-      ctx.translate(cx, cy)
-      ctx.rotate(t)
-      ctx.fillStyle = '#ef4444'
-      ctx.beginPath()
-      ctx.moveTo(len, 0)
-      ctx.lineTo(-len * 0.6, len * 0.5)
-      ctx.lineTo(-len * 0.6, -len * 0.5)
-      ctx.closePath()
-      ctx.fill()
-      ctx.strokeStyle = '#fff'
-      ctx.lineWidth = 1
-      ctx.stroke()
-      ctx.restore()
-    }
-  }, [mapData, robotPose])
 
   // WebRTC: video + control data channel; create offer, POST to server, attach remote track to <video>; fallback to MJPEG/HTTP on failure
   useEffect(() => {
@@ -566,147 +444,6 @@ function App() {
       }
       if (videoRef.current) {
         videoRef.current.srcObject = null
-      }
-    }
-  }, [])
-
-  // WebRTC: occupancy stream (annotated floor overlay); second connection, no data channel
-  useEffect(() => {
-    let cancelled = false
-    let videoTrackReceivedOccupancy = false
-    let videoTrackTimeoutOccupancy: number | null = null
-    const pc = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    })
-    pcOccupancyRef.current = pc
-
-    // Request video so server includes occupancy track in answer
-    pc.addTransceiver('video', { direction: 'recvonly' })
-
-    pc.ontrack = (event) => {
-      if (cancelled || !videoRefOccupancy.current) return
-      console.log('[WebRTC] Occupancy video track received:', event.track.kind, event.track.id, 'readyState:', event.track.readyState)
-      videoTrackReceivedOccupancy = true
-      if (videoTrackTimeoutOccupancy) {
-        clearTimeout(videoTrackTimeoutOccupancy)
-        videoTrackTimeoutOccupancy = null
-      }
-      const stream = event.streams[0] ?? new MediaStream([event.track])
-      
-      // Ensure video element is ready
-      if (videoRefOccupancy.current) {
-        videoRefOccupancy.current.srcObject = stream
-        
-        // Play the video explicitly
-        videoRefOccupancy.current.play().then(() => {
-          console.log('[WebRTC] Occupancy video playing successfully')
-          setVideoModeOccupancy('webrtc')
-          setVideoErrorOccupancy(false)
-        }).catch((error) => {
-          console.error('[WebRTC] Failed to play occupancy video:', error)
-          setVideoModeOccupancy('mjpeg') // Fallback to MJPEG
-          setVideoErrorOccupancy(false)
-        })
-        
-        // Monitor track state
-        event.track.onended = () => {
-          console.warn('[WebRTC] Occupancy track ended')
-          setVideoModeOccupancy('mjpeg')
-          setVideoErrorOccupancy(false)
-        }
-        
-        event.track.onmute = () => {
-          console.warn('[WebRTC] Occupancy track muted')
-        }
-        
-        event.track.onunmute = () => {
-          console.log('[WebRTC] Occupancy track unmuted')
-        }
-      }
-    }
-
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState
-      console.log(`[WebRTC Occupancy] Connection state: ${state}`)
-      if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-        if (videoTrackTimeoutOccupancy) {
-          clearTimeout(videoTrackTimeoutOccupancy)
-          videoTrackTimeoutOccupancy = null
-        }
-        if (!cancelled) {
-          console.warn(`[WebRTC Occupancy] Connection ${state}, falling back to MJPEG`)
-          setVideoModeOccupancy('mjpeg')
-          setVideoErrorOccupancy(false)
-        }
-      } else if (state === 'connected') {
-        console.log('[WebRTC Occupancy] Peer connection established')
-        if (!videoTrackReceivedOccupancy) {
-          videoTrackTimeoutOccupancy = window.setTimeout(() => {
-            if (!cancelled && !videoTrackReceivedOccupancy) {
-              console.warn('[WebRTC Occupancy] Connection established but no video track within 5s, falling back to MJPEG')
-              setVideoModeOccupancy('mjpeg')
-              setVideoErrorOccupancy(false)
-            }
-            videoTrackTimeoutOccupancy = null
-          }, 5000)
-        }
-      }
-    }
-    
-    pc.oniceconnectionstatechange = () => {
-      console.log(`[WebRTC Occupancy] ICE connection state: ${pc.iceConnectionState}`)
-    }
-    
-    pc.onicegatheringstatechange = () => {
-      console.log(`[WebRTC Occupancy] ICE gathering state: ${pc.iceGatheringState}`)
-    }
-
-    const connect = async () => {
-      try {
-        console.log('[WebRTC Occupancy] Creating offer...')
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        console.log('[WebRTC Occupancy] Sending offer to server...')
-        
-        const res = await fetch(`${API_BASE}/api/webrtc/occupancy/offer`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sdp: pc.localDescription?.sdp, type: pc.localDescription?.type }),
-        })
-        
-        if (cancelled) return
-        
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({}))
-          console.warn('[WebRTC Occupancy] Offer failed:', res.status, data)
-          setVideoModeOccupancy('mjpeg')
-          setVideoErrorOccupancy(false)
-          return
-        }
-        
-        const answer = await res.json()
-        await pc.setRemoteDescription(new RTCSessionDescription(answer))
-        console.log('[WebRTC Occupancy] Answer received, connection establishing...')
-      } catch (e) {
-        if (!cancelled) {
-          console.error('[WebRTC Occupancy] Connection error:', e)
-          setVideoModeOccupancy('mjpeg')
-          setVideoErrorOccupancy(false)
-        }
-      }
-    }
-    connect()
-
-    return () => {
-      cancelled = true
-      if (videoTrackTimeoutOccupancy) {
-        clearTimeout(videoTrackTimeoutOccupancy)
-        videoTrackTimeoutOccupancy = null
-      }
-      pc.close()
-      pcOccupancyRef.current = null
-      if (videoRefOccupancy.current) {
-        videoRefOccupancy.current.srcObject = null
       }
     }
   }, [])
@@ -1063,81 +800,7 @@ function App() {
                 </div>
               </Card>
             </Grid.Col>
-            <Grid.Col span={{ base: 12, md: 4 }}>
-              <Card shadow="sm" padding="lg" radius="md" withBorder>
-                <Title order={4} mb="xs">Occupancy (floor grid overlay)</Title>
-                <Text size="sm" c="dimmed" mb="sm">
-                  {videoModeOccupancy === 'webrtc'
-                    ? 'Live WebRTC: floor segmentation + BEV mini-map (via ROS2).'
-                    : 'Live MJPEG fallback: occupancy annotated stream.'}
-                </Text>
-                <div style={{ minHeight: 240, background: '#1a1b1e', display: 'flex', alignItems: 'center', justifyContent: 'center', position: 'relative' }}>
-                  {videoErrorOccupancy ? (
-                    <Text size="sm" c="dimmed">Occupancy stream unavailable. Ensure occupancy node and ros2_app_bridge are running.</Text>
-                  ) : (
-                    <>
-                      {videoModeOccupancy === 'webrtc' ? (
-                        <video
-                          ref={videoRefOccupancy}
-                          autoPlay
-                          playsInline
-                          muted
-                          style={{ maxWidth: '100%', maxHeight: 360, objectFit: 'contain' }}
-                          onLoadedMetadata={() => {
-                            console.log('[Video] Occupancy metadata loaded')
-                            setVideoErrorOccupancy(false)
-                          }}
-                          onError={(e) => {
-                            console.error('[Video] Occupancy error:', e)
-                            setVideoErrorOccupancy(true)
-                          }}
-                          onPlay={() => {
-                            console.log('[Video] Occupancy playing')
-                            setVideoErrorOccupancy(false)
-                          }}
-                        />
-                      ) : (
-                        <img
-                          src={`${API_BASE}/api/video/occupancy/stream`}
-                          alt="Occupancy"
-                          style={{ maxWidth: '100%', maxHeight: 360, objectFit: 'contain' }}
-                          onError={(e) => {
-                            console.error('[MJPEG] Occupancy image load error:', e)
-                            setVideoErrorOccupancy(true)
-                          }}
-                          onLoad={() => {
-                            console.log('[MJPEG] Occupancy image loaded successfully')
-                            setVideoErrorOccupancy(false)
-                          }}
-                        />
-                      )}
-                      {!occupancyReceivedFrames && (
-                        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.7)' }}>
-                          <Text size="sm" c="dimmed" ta="center" maw={320}>
-                            Waiting for occupancy stream… Front camera must be active so the occupancy node can process frames. Check ros2_bridge and ros2_app_bridge.
-                          </Text>
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              </Card>
-            </Grid.Col>
           </Grid>
-
-          <Card shadow="sm" padding="lg" radius="md" withBorder>
-            <Title order={4} mb="xs">Map</Title>
-            <Text size="sm" c="dimmed" mb="sm">
-              Persistent occupancy map and robot position. Green: free, gray: occupied.
-            </Text>
-            <div style={{ minHeight: 240, background: '#1a1b1e', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              {!mapData ? (
-                <Text size="sm" c="dimmed">No map yet. Ensure ros2_app_bridge is running.</Text>
-              ) : (
-                <canvas ref={mapCanvasRef} style={{ maxWidth: '100%', height: 'auto' }} />
-              )}
-            </div>
-          </Card>
 
           <Card shadow="sm" padding="lg" radius="md" withBorder>
             <Title order={4} mb="xs">Drive (WASD)</Title>
@@ -1172,49 +835,6 @@ function App() {
               >
                 {controlStatus === 'sent' ? 'Sent' : controlStatus === 'error' ? 'Error' : 'Send Frodobots control'}
               </Button>
-              <Button
-                color="green"
-                variant="filled"
-                loading={wanderLoading}
-                disabled={wanderActive}
-                onClick={async () => {
-                  setWanderLoading(true)
-                  try {
-                    const res = await fetch(`${API_BASE}/api/wander/start`, { method: 'POST' })
-                    const data = await res.json().catch(() => ({}))
-                    if (res.ok && data.ok) {
-                      setWanderActive(true)
-                    }
-                  } finally {
-                    setWanderLoading(false)
-                  }
-                }}
-              >
-                Start wander
-              </Button>
-              <Button
-                color="red"
-                variant="filled"
-                loading={wanderLoading}
-                disabled={!wanderActive}
-                onClick={async () => {
-                  setWanderLoading(true)
-                  try {
-                    const res = await fetch(`${API_BASE}/api/wander/stop`, { method: 'POST' })
-                    const data = await res.json().catch(() => ({}))
-                    if (res.ok && data.ok) {
-                      setWanderActive(false)
-                    }
-                  } finally {
-                    setWanderLoading(false)
-                  }
-                }}
-              >
-                Stop wander
-              </Button>
-              {wanderActive && (
-                <Badge color="green" variant="filled">Wander on</Badge>
-              )}
               <Button variant="filled">Create New</Button>
               <Button variant="outline">Export Data</Button>
               <Button variant="light">View Reports</Button>

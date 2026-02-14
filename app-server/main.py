@@ -54,15 +54,6 @@ _last_frame_post_time: float = 0.0  # when we last received a frame from ros2_ap
 # WebRTC: pre-decoded BGR (updated once per POST) so track recv() doesn't decode every time → lower latency
 latest_front_bgr: "np.ndarray | None" = None
 
-# Occupancy stream: annotated video (floor overlay + BEV) from ros2_app_bridge
-latest_occupancy_bgr: "np.ndarray | None" = None
-video_stream_subscribers_occupancy: List[asyncio.Queue[bytes]] = []
-_last_occupancy_frame_time: float | None = None  # monotonic time when we last received a frame
-
-# Map and robot pose from ros2-app-bridge (POST /api/map/update)
-latest_map: dict | None = None  # { width, height, resolution, origin: {x,y}, data }
-latest_robot_pose: dict | None = None  # { x, y, theta }
-
 # Minimal 1x1 gray JPEG so stream always sends something before first real frame
 _PLACEHOLDER_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/2gAMAwEAAhEDEQA/ALJ//9k="
@@ -92,7 +83,7 @@ webrtc_pcs: Set = set()
 webrtc_data_channels: dict = {}
 
 # WebRTC: ROS2 App Bridge peer connections (for forwarding video and control)
-ros2_bridge_pcs: dict = {}  # Key: "front" or "occupancy", Value: RTCPeerConnection
+ros2_bridge_pcs: dict = {}  # Key: "front", Value: RTCPeerConnection
 ros2_bridge_data_channels: dict = {}  # Key: RTCPeerConnection, Value: RTCDataChannel
 
 # WebRTC statistics tracking
@@ -309,7 +300,13 @@ app = FastAPI(title="App Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
+    ],
+    allow_origin_regex=r"http://[^/]+:(5173|3000)$",  # same host, Vite/React dev ports
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -423,54 +420,6 @@ async def video_frame_raw(request: Request):
     return {"ok": True}
 
 
-@app.post("/api/video/occupancy/frame/raw")
-async def video_occupancy_frame_raw(request: Request):
-    """Accept raw BGR bytes from ros2_app_bridge (occupancy annotated image)."""
-    global latest_occupancy_bgr, _last_occupancy_frame_time
-    _last_occupancy_frame_time = time.monotonic()
-    body = await request.body()
-    width = request.headers.get("X-Width")
-    height = request.headers.get("X-Height")
-    if not body or not width or not height:
-        return {"ok": False, "error": "empty body or missing X-Width/X-Height"}
-    try:
-        w, h = int(width), int(height)
-    except ValueError:
-        return {"ok": False, "error": "invalid X-Width or X-Height"}
-    expected = h * w * 3
-    if len(body) != expected:
-        return {"ok": False, "error": f"body length {len(body)} != {expected}"}
-    # Log first frame and every 30th frame to reduce spam
-    if not hasattr(video_occupancy_frame_raw, '_frame_count'):
-        video_occupancy_frame_raw._frame_count = 0
-    video_occupancy_frame_raw._frame_count += 1
-    if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
-        logger.info(f"Received occupancy frame #{video_occupancy_frame_raw._frame_count} via HTTP: {w}x{h}, size={len(body)} bytes")
-    arr = np.frombuffer(body, dtype=np.uint8).reshape((h, w, 3)).copy()
-    latest_occupancy_bgr = arr
-    
-    # Send to MJPEG subscribers
-    if video_stream_subscribers_occupancy:
-        jpeg = _bgr_to_jpeg(arr)
-        if jpeg:
-            chunk = _mjpeg_chunk(jpeg)
-            dead: List[int] = []
-            for i, q in enumerate(video_stream_subscribers_occupancy):
-                try:
-                    q.put_nowait(chunk)
-                except Exception:
-                    dead.append(i)
-            for i in reversed(dead):
-                video_stream_subscribers_occupancy.pop(i)
-            if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
-                logger.info(f"Sent occupancy frame #{video_occupancy_frame_raw._frame_count} to {len(video_stream_subscribers_occupancy)} MJPEG subscribers")
-    else:
-        if video_occupancy_frame_raw._frame_count == 1 or video_occupancy_frame_raw._frame_count % 30 == 0:
-            logger.debug("Occupancy frame #%s received but no MJPEG subscribers (client may connect later)", video_occupancy_frame_raw._frame_count)
-    
-    return {"ok": True}
-
-
 async def _stream_generator(client_queue: asyncio.Queue[bytes]) -> bytes:
     """Yield MJPEG chunks until client disconnects; remove queue on exit."""
     try:
@@ -516,54 +465,6 @@ async def video_front_stream():
         _stream_generator(client_queue),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
-
-
-async def _occupancy_stream_generator(client_queue: asyncio.Queue[bytes]) -> bytes:
-    """Yield MJPEG chunks for occupancy stream until client disconnects; remove queue on exit."""
-    try:
-        while True:
-            yield await client_queue.get()
-    finally:
-        try:
-            video_stream_subscribers_occupancy.remove(client_queue)
-            # Clear any remaining items in the queue to free memory
-            while not client_queue.empty():
-                try:
-                    client_queue.get_nowait()
-                except Exception:
-                    break
-        except ValueError:
-            pass
-
-
-@app.get("/api/video/occupancy/stream")
-async def video_occupancy_stream():
-    """Long-lived MJPEG stream: occupancy annotated video (floor overlay + BEV)."""
-    # Limit queue size to prevent memory buildup (max 5 frames buffered per client)
-    client_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=5)
-    video_stream_subscribers_occupancy.append(client_queue)
-    if latest_occupancy_bgr is not None:
-        initial = _bgr_to_jpeg(latest_occupancy_bgr)
-        initial = _mjpeg_chunk(initial) if initial else _mjpeg_chunk(_PLACEHOLDER_JPEG)
-    else:
-        initial = _mjpeg_chunk(_PLACEHOLDER_JPEG)
-    try:
-        client_queue.put_nowait(initial)
-    except Exception:
-        pass
-    return StreamingResponse(
-        _occupancy_stream_generator(client_queue),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-@app.get("/api/occupancy/status")
-async def occupancy_status():
-    """Return whether occupancy frames have been received (for UI waiting state)."""
-    return {
-        "received_frames": latest_occupancy_bgr is not None,
-        "last_frame_at": _last_occupancy_frame_time,
-    }
 
 
 # --- WebRTC signaling (true low-latency video) ---
@@ -727,72 +628,6 @@ async def webrtc_offer(body: WebRTCOfferBody):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.post("/api/webrtc/occupancy/offer")
-async def webrtc_occupancy_offer(body: WebRTCOfferBody):
-    """Accept SDP offer for occupancy stream; return SDP answer with single video track (annotated floor overlay)."""
-    if not HAS_WEBRTC:
-        return JSONResponse(
-            content={"error": "WebRTC not available (install aiortc, av, numpy)"},
-            status_code=503,
-        )
-    offer = RTCSessionDescription(sdp=body.sdp, type=body.type)
-    pc = RTCPeerConnection()
-    webrtc_pcs.add(pc)
-
-    def get_latest_occupancy_bgr():
-        return latest_occupancy_bgr
-
-    # Check if offer has video before adding track
-    sdp_lines = body.sdp.split('\n') if body.sdp else []
-    has_video = any('m=video' in line for line in sdp_lines)
-    
-    if has_video:
-        track = LiveFrameTrack(get_latest_occupancy_bgr)
-        pc.addTrack(track)
-        logger.info("WebRTC occupancy track added to peer connection (offer includes video)")
-    else:
-        logger.info("WebRTC occupancy offer has no video - will use HTTP/MJPEG fallback")
-
-    @pc.on("track")
-    def on_track(track):
-        logger.info("WebRTC occupancy: remote track received: %s", track.kind)
-
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        state = pc.connectionState
-        logger.info("WebRTC occupancy peer connection state changed: %s", state)
-        if state in ("failed", "closed", "disconnected"):
-            logger.warning("WebRTC occupancy peer connection %s, cleaning up", state)
-            webrtc_pcs.discard(pc)
-            await pc.close()
-
-    try:
-        await pc.setRemoteDescription(offer)
-        answer = await pc.createAnswer()
-        if not answer or not hasattr(answer, 'sdp') or not answer.sdp:
-            raise ValueError("createAnswer() returned invalid answer - missing SDP")
-        await pc.setLocalDescription(answer)
-        
-        # Log answer SDP to verify data channel is included
-        if answer.sdp:
-            answer_sdp_lines = answer.sdp.split('\n')
-            answer_has_data_channel = any('m=application' in line for line in answer_sdp_lines)
-            logger.info("WebRTC occupancy answer created - SDP contains data channel: %s", answer_has_data_channel)
-        
-        if not pc.localDescription or not pc.localDescription.sdp:
-            raise ValueError("Failed to create local description - missing SDP")
-        
-        return {
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type,
-        }
-    except Exception as e:
-        logger.error("WebRTC occupancy offer failed: %s", e, exc_info=True)
-        webrtc_pcs.discard(pc)
-        await pc.close()
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
 @app.post("/api/webrtc/ros2-bridge/offer")
 async def webrtc_ros2_bridge_offer(body: WebRTCOfferBody):
     """Accept SDP offer from ROS2 App Bridge for video and control forwarding."""
@@ -820,9 +655,9 @@ async def webrtc_ros2_bridge_offer(body: WebRTCOfferBody):
             track_label = getattr(track, 'label', None) or getattr(track, 'id', 'unknown')
             logger.info("WebRTC ROS2 Bridge video track received: %s", track_label)
             # Update latest BGR frame from ROS2 Bridge
-            # We'll need to extract frames from the track and update latest_front_bgr or latest_occupancy_bgr
+            # We'll need to extract frames from the track and update latest_front_bgr
             # For now, log that we received it
-            # TODO: Extract frames from track and update latest_front_bgr/latest_occupancy_bgr
+            # TODO: Extract frames from track and update latest_front_bgr
     
     # Handle data channel for control commands
     @pc.on("datachannel")
@@ -962,73 +797,6 @@ def control(body: ControlBody):
             )
             _last_control_forward_warning_time = now
         return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
-
-
-def _forward_wander_enable(enable: bool) -> dict:
-    """Forward wander enable to ros2-app-bridge (publishes to /wander/enable)."""
-    data = json.dumps({"enable": enable}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{ROS2_APP_BRIDGE_URL}/wander/enable",
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            body_resp = resp.read().decode("utf-8")
-            logger.info(
-                "Wander enable forward: enable=%s status=%s body=%s",
-                enable, resp.status, body_resp.strip() or "(empty)",
-            )
-            if 200 <= resp.status < 300:
-                return {"ok": True}
-            return {"ok": False, "error": f"Bridge returned {resp.status}"}
-    except urllib.error.URLError as e:
-        logger.warning("Forward to ros2-app-bridge /wander/enable failed: %s", e)
-        return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
-
-
-@app.post("/api/wander/start")
-def wander_start():
-    """Enable wander (forward to bridge -> /wander/enable true)."""
-    return _forward_wander_enable(True)
-
-
-@app.post("/api/wander/stop")
-def wander_stop():
-    """Disable wander (forward to bridge -> /wander/enable false)."""
-    return _forward_wander_enable(False)
-
-
-@app.post("/api/map/update")
-async def map_update(request: Request):
-    """Accept map and pose from ros2-app-bridge; store for GET /api/map and /api/robot_pose."""
-    global latest_map, latest_robot_pose
-    try:
-        body = await request.json()
-        if "map" in body and body["map"] is not None:
-            latest_map = body["map"]
-        if "pose" in body and body["pose"] is not None:
-            latest_robot_pose = body["pose"]
-    except Exception as e:
-        logger.warning("Map update body error: %s", e)
-    return {"ok": True}
-
-
-@app.get("/api/map")
-def get_map():
-    """Return latest occupancy map (width, height, resolution, origin, data) for UI."""
-    if latest_map is None:
-        return JSONResponse(status_code=404, content={"error": "No map received yet"})
-    return latest_map
-
-
-@app.get("/api/robot_pose")
-def get_robot_pose():
-    """Return latest robot pose in map frame (x, y, theta) for UI."""
-    if latest_robot_pose is None:
-        return JSONResponse(status_code=404, content={"error": "No pose received yet"})
-    return latest_robot_pose
 
 
 @app.get("/api/webrtc/status")

@@ -32,9 +32,8 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String
+from std_msgs.msg import String
 
 try:
     import cv2
@@ -65,11 +64,8 @@ except ImportError as e:
 APP_SERVER_URL = os.environ.get("APP_SERVER_URL", "http://localhost:8001")
 INGEST_URL = f"{APP_SERVER_URL.rstrip('/')}/api/ingest"
 VIDEO_FRAME_RAW_URL = f"{APP_SERVER_URL.rstrip('/')}/api/video/frame/raw"
-VIDEO_OCCUPANCY_RAW_URL = f"{APP_SERVER_URL.rstrip('/')}/api/video/occupancy/frame/raw"
 WEBRTC_OFFER_URL = f"{APP_SERVER_URL.rstrip('/')}/api/webrtc/ros2-bridge/offer"
-MAP_UPDATE_URL = f"{APP_SERVER_URL.rstrip('/')}/api/map/update"
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "9000"))
-MAP_UPDATE_THROTTLE_S = 0.5
 
 # Target ~30 FPS; send raw BGR so app-server does single encode (WebRTC only)
 VIDEO_FRAME_TARGET_FPS = 30.0
@@ -77,41 +73,18 @@ VIDEO_FRAME_MIN_INTERVAL_S = 1.0 / VIDEO_FRAME_TARGET_FPS
 
 # Thread-safe queue for control commands (HTTP thread pushes, ROS2 timer drains)
 control_queue: queue.Queue = queue.Queue()
-# Queue for wander enable requests (HTTP thread pushes, ROS2 timer drains)
-wander_enable_queue: queue.Queue = queue.Queue()
 
 # WebRTC peer connections and data channels
 if HAS_WEBRTC:
     webrtc_pc_front: Optional[RTCPeerConnection] = None
-    webrtc_pc_occupancy: Optional[RTCPeerConnection] = None
     webrtc_data_channel: Optional = None
     webrtc_connected = False
     webrtc_lock = threading.Lock()
 else:
     webrtc_pc_front = None
-    webrtc_pc_occupancy = None
     webrtc_data_channel = None
     webrtc_connected = False
     webrtc_lock = threading.Lock()  # Still create lock even if WebRTC not available
-
-
-def post_map_update_sync(payload: dict) -> None:
-    """POST map and pose to app-server /api/map/update (blocking)."""
-    try:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            MAP_UPDATE_URL,
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            if 200 <= resp.status < 300:
-                logger.debug("Map update POST OK")
-            else:
-                logger.warning("Map update POST returned %s", resp.status)
-    except Exception as e:
-        logger.warning("Map update POST failed: %s", e)
 
 
 def post_message(payload: dict) -> bool:
@@ -170,29 +143,6 @@ def post_video_frame_raw_sync(bgr_body: bytes, width: int, height: int) -> None:
         logger.debug("POST video frame raw failed: %s", e)
 
 
-def post_occupancy_frame_raw_sync(bgr_body: bytes, width: int, height: int) -> None:
-    """
-    POST raw BGR bytes to app-server /api/video/occupancy/frame/raw (blocking; run in executor).
-    
-    NOTE: This is a FALLBACK method. WebRTC video tracks are preferred for video streaming.
-    HTTP POST is kept for debugging and compatibility when WebRTC is not available.
-    """
-    try:
-        req = urllib.request.Request(
-            VIDEO_OCCUPANCY_RAW_URL,
-            data=bgr_body,
-            headers={
-                "Content-Type": "application/octet-stream",
-                "X-Width": str(width),
-                "X-Height": str(height),
-            },
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=2)
-    except urllib.error.URLError as e:
-        logger.debug("POST occupancy frame raw failed: %s", e)
-
-
 # WebRTC LiveFrameTrack for forwarding ROS2 video frames
 if HAS_WEBRTC:
     class LiveFrameTrack(MediaStreamTrack):
@@ -226,7 +176,7 @@ async def setup_webrtc_connection(stream_type: str, get_latest_bgr: Callable[[],
         logger.warning("WebRTC not available, skipping WebRTC connection setup")
         return False
     
-    global webrtc_pc_front, webrtc_pc_occupancy, webrtc_data_channel, webrtc_connected
+    global webrtc_pc_front, webrtc_data_channel, webrtc_connected
     
     try:
         pc = RTCPeerConnection()
@@ -302,10 +252,7 @@ async def setup_webrtc_connection(stream_type: str, get_latest_bgr: Callable[[],
         
         # Store peer connection
         with webrtc_lock:
-            if stream_type == "front":
-                webrtc_pc_front = pc
-            elif stream_type == "occupancy":
-                webrtc_pc_occupancy = pc
+            webrtc_pc_front = pc
         
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
@@ -314,10 +261,7 @@ async def setup_webrtc_connection(stream_type: str, get_latest_bgr: Callable[[],
             if state in ("failed", "closed", "disconnected"):
                 logger.warning(f"WebRTC {stream_type} connection {state}, will attempt reconnection")
                 with webrtc_lock:
-                    if stream_type == "front":
-                        webrtc_pc_front = None
-                    elif stream_type == "occupancy":
-                        webrtc_pc_occupancy = None
+                    webrtc_pc_front = None
                 await pc.close()
         
         logger.info(f"WebRTC {stream_type} connection established successfully")
@@ -328,9 +272,9 @@ async def setup_webrtc_connection(stream_type: str, get_latest_bgr: Callable[[],
         return False
 
 
-def make_control_handler(control_q: queue.Queue, wander_enable_q: queue.Queue):
+def make_control_handler(control_q: queue.Queue):
     """
-    Factory for HTTP handler: /control -> control queue, /wander/enable -> wander enable queue.
+    Factory for HTTP handler: /control -> control queue.
     WebRTC data channel is preferred for control; HTTP is fallback.
     """
 
@@ -341,30 +285,6 @@ def make_control_handler(control_q: queue.Queue, wander_enable_q: queue.Queue):
         def do_POST(self):
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length) if content_length else b""
-
-            if self.path == "/wander/enable":
-                try:
-                    data = json.loads(body.decode("utf-8"))
-                    enable = data.get("enable")
-                    if not isinstance(enable, bool):
-                        self.send_response(400)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(b'{"error": "enable must be boolean"}\n')
-                        return
-                    wander_enable_q.put(enable)
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"ok": true}\n')
-                    logger.info("Wander enable: %s", enable)
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning("Invalid wander/enable body: %s", e)
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8") + b"\n")
-                return
 
             if self.path != "/control":
                 self.send_response(404)
@@ -398,11 +318,9 @@ def make_control_handler(control_q: queue.Queue, wander_enable_q: queue.Queue):
     return ControlHandler
 
 
-def run_control_server(
-    port: int, control_q: queue.Queue, wander_enable_q: queue.Queue
-) -> None:
-    """Run HTTP server for POST /control and POST /wander/enable in this thread."""
-    handler = make_control_handler(control_q, wander_enable_q)
+def run_control_server(port: int, control_q: queue.Queue) -> None:
+    """Run HTTP server for POST /control in this thread."""
+    handler = make_control_handler(control_q)
     with HTTPServer(("0.0.0.0", port), handler) as server:
         logger.info("Control server listening on port %s", port)
         server.serve_forever()
@@ -422,13 +340,11 @@ class Ros2AppBridge(Node):
             10,
         )
         self.control_pub = self.create_publisher(String, "/robot/control", 10)
-        self.wander_enable_pub = self.create_publisher(Bool, "/wander/enable", 10)
         # Drain control queue at 50 Hz for minimal latency (robot ← ROS2 ← webapp)
         self.control_timer = self.create_timer(0.02, self._drain_control_queue)
         
         # Latest BGR frames for WebRTC tracks
         self._latest_front_bgr: Optional[np.ndarray] = None
-        self._latest_occupancy_bgr: Optional[np.ndarray] = None
         self._bgr_lock = threading.Lock()
         
         # HTTP fallback (keep for compatibility)
@@ -437,18 +353,12 @@ class Ros2AppBridge(Node):
         self._video_lock = threading.Lock()
         self._pending_raw: tuple[bytes, int, int] | None = None
         self._post_future = None
-        self._last_occupancy_encode_time = 0.0
-        self._occupancy_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="occupancy_post")
-        self._occupancy_lock = threading.Lock()
-        self._pending_occupancy_raw: tuple[bytes, int, int] | None = None
-        self._occupancy_post_future = None
-        self._map_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map_post")
         
         # WebRTC event loop (run in separate thread)
         self._webrtc_loop: Optional[asyncio.AbstractEventLoop] = None
         self._webrtc_thread: Optional[threading.Thread] = None
         if HAS_CV2:
-            # Use sensor_data QoS (BEST_EFFORT) to match video and occupancy publishers
+            # Use sensor_data QoS (BEST_EFFORT) to match video publishers
             sensor_qos = QoSProfile(
                 reliability=ReliabilityPolicy.BEST_EFFORT,
                 history=HistoryPolicy.KEEP_LAST,
@@ -465,41 +375,11 @@ class Ros2AppBridge(Node):
             self.get_logger().info(
                 f"Bridge: /robot/video/front -> {VIDEO_FRAME_RAW_URL} raw BGR (target {VIDEO_FRAME_TARGET_FPS} FPS, single encode at server)"
             )
-            self.occupancy_sub = self.create_subscription(
-                Image,
-                "/occupancy/annotated_image",
-                self._occupancy_callback,
-                sensor_qos,
-            )
-            self.get_logger().info("✓ Subscribed to ROS2 topic: /occupancy/annotated_image")
-            self.get_logger().info(
-                f"Bridge: /occupancy/annotated_image -> {VIDEO_OCCUPANCY_RAW_URL} raw BGR (target {VIDEO_FRAME_TARGET_FPS} FPS)"
-            )
         else:
             self.get_logger().warn("cv2 not available; front camera streaming disabled")
         self.get_logger().info(f"Bridge: /chatter -> {INGEST_URL}")
         self.get_logger().info("Bridge: POST /control -> /robot/control (HTTP fallback)")
-        self.get_logger().info("Bridge: POST /wander/enable -> /wander/enable")
 
-        # Map and pose for app-server UI
-        self._map_lock = threading.Lock()
-        self._latest_map: Optional[dict] = None
-        self._latest_pose: Optional[dict] = None
-        self._last_map_post_time = 0.0
-        self.map_sub = self.create_subscription(
-            OccupancyGrid,
-            "/map",
-            self._map_callback,
-            10,
-        )
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            "/map_odom",
-            self._odom_callback,
-            10,
-        )
-        self.get_logger().info(f"Bridge: /map, /map_odom -> POST {MAP_UPDATE_URL}")
-        
         # Initialize WebRTC connections if available
         if HAS_WEBRTC and HAS_CV2:
             self._init_webrtc()
@@ -532,11 +412,6 @@ class Ros2AppBridge(Node):
                 with self._bgr_lock:
                     return self._latest_front_bgr.copy() if self._latest_front_bgr is not None else None
             
-            # Setup occupancy connection
-            def get_occupancy_bgr():
-                with self._bgr_lock:
-                    return self._latest_occupancy_bgr.copy() if self._latest_occupancy_bgr is not None else None
-            
             async def setup_connections():
                 # Wait a bit for ROS2 to initialize
                 await asyncio.sleep(2)
@@ -547,13 +422,6 @@ class Ros2AppBridge(Node):
                     self.get_logger().info("WebRTC front camera connection established")
                 else:
                     self.get_logger().warn("WebRTC front camera connection failed, using HTTP fallback")
-                
-                # Setup occupancy WebRTC connection
-                occupancy_success = await setup_webrtc_connection("occupancy", get_occupancy_bgr)
-                if occupancy_success:
-                    self.get_logger().info("WebRTC occupancy connection established")
-                else:
-                    self.get_logger().warn("WebRTC occupancy connection failed, using HTTP fallback")
             
             try:
                 loop.run_until_complete(setup_connections())
@@ -633,109 +501,6 @@ class Ros2AppBridge(Node):
                 f.add_done_callback(self._on_video_post_done)
                 self._post_future = f
 
-    def _on_occupancy_post_done(self, future) -> None:
-        """When occupancy POST completes, send pending frame if any."""
-        with self._occupancy_lock:
-            pending = self._pending_occupancy_raw
-            self._pending_occupancy_raw = None
-            self._occupancy_post_future = None
-        if pending is not None:
-            bgr_bytes, w, h = pending
-            f = self._occupancy_executor.submit(post_occupancy_frame_raw_sync, bgr_bytes, w, h)
-            f.add_done_callback(self._on_occupancy_post_done)
-            with self._occupancy_lock:
-                self._occupancy_post_future = f
-
-    def _occupancy_callback(self, msg: Image) -> None:
-        """Update latest occupancy BGR frame for WebRTC track, fallback to HTTP POST if WebRTC not available."""
-        # Log every callback to verify it's being called
-        if not hasattr(self, '_callback_count_occupancy'):
-            self._callback_count_occupancy = 0
-        self._callback_count_occupancy += 1
-        if self._callback_count_occupancy <= 5 or self._callback_count_occupancy % 100 == 0:
-            self.get_logger().info(f"Occupancy callback #{self._callback_count_occupancy} triggered - msg encoding: {msg.encoding}, size: {msg.width}x{msg.height}")
-        
-        raw = image_to_bgr_bytes(msg)
-        if raw is None:
-            self.get_logger().warn(
-                f"Occupancy frame skipped (encoding={getattr(msg, 'encoding', '?')}); expected bgr8/rgb8/8UC3"
-            )
-            return
-        bgr_bytes, w, h = raw
-        # Log first frame and then every 30 frames to reduce spam
-        if not hasattr(self, '_frame_count_occupancy'):
-            self._frame_count_occupancy = 0
-        self._frame_count_occupancy += 1
-        if self._frame_count_occupancy == 1 or self._frame_count_occupancy % 30 == 0:
-            self.get_logger().info(f"Received occupancy frame #{self._frame_count_occupancy} from ROS2: {w}x{h}, encoding={msg.encoding}")
-        
-        # Convert bytes to numpy array for WebRTC track
-        bgr_array = np.frombuffer(bgr_bytes, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-        
-        # Update latest BGR frame for WebRTC track
-        with self._bgr_lock:
-            self._latest_occupancy_bgr = bgr_array
-        
-        # Always use HTTP fallback to ensure frames reach app-server
-        # WebRTC is preferred but HTTP ensures reliability
-        use_http = True
-        
-        if use_http:
-            now = time.monotonic()
-            if now - self._last_occupancy_encode_time < VIDEO_FRAME_MIN_INTERVAL_S:
-                return
-            self._last_occupancy_encode_time = now
-            with self._occupancy_lock:
-                in_flight = self._occupancy_post_future is not None and not self._occupancy_post_future.done()
-                if in_flight:
-                    self._pending_occupancy_raw = (bgr_bytes, w, h)
-                    return
-                # Log every 30 frames to reduce spam
-                if not hasattr(self, '_http_frame_count_occupancy'):
-                    self._http_frame_count_occupancy = 0
-                self._http_frame_count_occupancy = getattr(self, '_http_frame_count_occupancy', 0) + 1
-                if self._http_frame_count_occupancy == 1 or self._http_frame_count_occupancy % 30 == 0:
-                    self.get_logger().info(f"Forwarding occupancy frame #{self._http_frame_count_occupancy} via HTTP: {w}x{h}, size={len(bgr_bytes)} bytes")
-                f = self._occupancy_executor.submit(post_occupancy_frame_raw_sync, bgr_bytes, w, h)
-                f.add_done_callback(self._on_occupancy_post_done)
-                self._occupancy_post_future = f
-
-    def _map_callback(self, msg: OccupancyGrid) -> None:
-        with self._map_lock:
-            self._latest_map = {
-                "width": msg.info.width,
-                "height": msg.info.height,
-                "resolution": msg.info.resolution,
-                "origin": {"x": msg.info.origin.position.x, "y": msg.info.origin.position.y},
-                "data": list(msg.data),
-            }
-        self._maybe_post_map_update()
-
-    def _odom_callback(self, msg: Odometry) -> None:
-        qz = msg.pose.pose.orientation.z
-        qw = msg.pose.pose.orientation.w
-        theta = 2.0 * np.arctan2(qz, qw)
-        with self._map_lock:
-            self._latest_pose = {
-                "x": msg.pose.pose.position.x,
-                "y": msg.pose.pose.position.y,
-                "theta": float(theta),
-            }
-        self._maybe_post_map_update()
-
-    def _maybe_post_map_update(self) -> None:
-        now = time.monotonic()
-        if now - self._last_map_post_time < MAP_UPDATE_THROTTLE_S:
-            return
-        with self._map_lock:
-            map_data = self._latest_map
-            pose_data = self._latest_pose
-        if map_data is None and pose_data is None:
-            return
-        self._last_map_post_time = now
-        payload = {"map": map_data, "pose": pose_data}
-        self._map_executor.submit(post_map_update_sync, payload)
-
     def callback(self, msg: String) -> None:
         payload = {
             "topic": "/chatter",
@@ -748,16 +513,7 @@ class Ros2AppBridge(Node):
 
     def _drain_control_queue(self) -> None:
         """Drain control queue and publish to /robot/control (50 Hz for real-time).
-        When a stop (linear=0, angular=0) is seen, clear any pending commands so only stop is applied immediately.
-        Also drain wander_enable_queue and publish to /wander/enable."""
-        try:
-            while True:
-                enable = wander_enable_queue.get_nowait()
-                msg = Bool()
-                msg.data = enable
-                self.wander_enable_pub.publish(msg)
-        except queue.Empty:
-            pass
+        When a stop (linear=0, angular=0) is seen, clear any pending commands so only stop is applied immediately."""
         try:
             while True:
                 cmd = control_queue.get_nowait()
@@ -791,7 +547,7 @@ def main() -> None:
     # Start control HTTP server in background thread
     server_thread = threading.Thread(
         target=run_control_server,
-        args=(CONTROL_PORT, control_queue, wander_enable_queue),
+        args=(CONTROL_PORT, control_queue),
         daemon=True,
     )
     server_thread.start()
@@ -804,8 +560,6 @@ def main() -> None:
     finally:
         if HAS_CV2 and hasattr(node, "_video_executor"):
             node._video_executor.shutdown(wait=False)
-        if HAS_CV2 and hasattr(node, "_occupancy_executor"):
-            node._occupancy_executor.shutdown(wait=False)
         node.destroy_node()
         rclpy.shutdown()
 
