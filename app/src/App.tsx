@@ -49,6 +49,11 @@ function App() {
   const [occupancyReceivedFrames, setOccupancyReceivedFrames] = useState(false)
   const [controlMethod, setControlMethod] = useState<'webrtc' | 'http' | 'connecting'>('connecting')
   const [webrtcConnectionState, setWebrtcConnectionState] = useState<string>('new')
+  const [wanderActive, setWanderActive] = useState(false)
+  const [wanderLoading, setWanderLoading] = useState(false)
+  const [mapData, setMapData] = useState<{ width: number; height: number; resolution: number; origin: { x: number; y: number }; data: number[] } | null>(null)
+  const [robotPose, setRobotPose] = useState<{ x: number; y: number; theta: number } | null>(null)
+  const mapCanvasRef = useRef<HTMLCanvasElement>(null)
   const driveRef = useRef<DriveState>({ linear: 0, angular: 0, lamp: 0 })
   const keysPressedRef = useRef<Set<string>>(new Set()) // Track which keys are currently pressed
   const lastKeyEventRef = useRef<number>(0) // For safety: force stop if keyup missed (e.g. focus loss)
@@ -216,6 +221,91 @@ function App() {
     const id = setInterval(check, 2000)
     return () => clearInterval(id)
   }, [])
+
+  // Poll map and robot pose for Map card
+  useEffect(() => {
+    const fetchMapAndPose = async () => {
+      try {
+        const [mapRes, poseRes] = await Promise.all([
+          fetch(`${API_BASE}/api/map`),
+          fetch(`${API_BASE}/api/robot_pose`),
+        ])
+        if (mapRes.ok) {
+          const data = await mapRes.json()
+          setMapData(data)
+        } else {
+          setMapData(null)
+        }
+        if (poseRes.ok) {
+          const data = await poseRes.json()
+          setRobotPose(data)
+        } else {
+          setRobotPose(null)
+        }
+      } catch {
+        setMapData(null)
+        setRobotPose(null)
+      }
+    }
+    fetchMapAndPose()
+    const id = setInterval(fetchMapAndPose, 1500)
+    return () => clearInterval(id)
+  }, [])
+
+  // Draw map and robot on canvas when data changes
+  useEffect(() => {
+    const canvas = mapCanvasRef.current
+    if (!canvas || !mapData) return
+    const { width: w, height: h, resolution, origin, data } = mapData
+    if (w < 1 || h < 1) return
+    const dpr = window.devicePixelRatio || 1
+    const displayW = 400
+    const displayH = 400
+    const scale = Math.min(displayW / w, displayH / h)
+    canvas.width = displayW * dpr
+    canvas.height = displayH * dpr
+    canvas.style.width = `${displayW}px`
+    canvas.style.height = `${displayH}px`
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.scale(dpr, dpr)
+    ctx.fillStyle = '#2d2d2d'
+    ctx.fillRect(0, 0, displayW, displayH)
+    const cellW = scale
+    const cellH = scale
+    for (let row = 0; row < h; row++) {
+      for (let col = 0; col < w; col++) {
+        const v = data[row * w + col]
+        if (v === 0) ctx.fillStyle = '#4ade80'
+        else if (v === 100) ctx.fillStyle = '#404040'
+        else ctx.fillStyle = '#6b7280'
+        ctx.fillRect(col * scale, row * scale, Math.ceil(cellW), Math.ceil(cellH))
+      }
+    }
+    if (robotPose) {
+      const px = (robotPose.x - origin.x) / resolution
+      const py = (robotPose.y - origin.y) / resolution
+      const cx = px * scale
+      const cy = py * scale
+      const len = 8
+      const t = robotPose.theta
+      ctx.save()
+      ctx.translate(cx, cy)
+      ctx.rotate(t)
+      ctx.fillStyle = '#ef4444'
+      ctx.beginPath()
+      ctx.moveTo(len, 0)
+      ctx.lineTo(-len * 0.6, len * 0.5)
+      ctx.lineTo(-len * 0.6, -len * 0.5)
+      ctx.closePath()
+      ctx.fill()
+      ctx.strokeStyle = '#fff'
+      ctx.lineWidth = 1
+      ctx.stroke()
+      ctx.restore()
+    }
+  }, [mapData, robotPose])
 
   // WebRTC: video + control data channel; create offer, POST to server, attach remote track to <video>; fallback to MJPEG/HTTP on failure
   useEffect(() => {
@@ -924,7 +1014,7 @@ function App() {
           </Card>
 
           <Grid>
-            <Grid.Col span={{ base: 12, md: 6 }}>
+            <Grid.Col span={{ base: 12, md: 4 }}>
               <Card shadow="sm" padding="lg" radius="md" withBorder>
                 <Title order={4} mb="xs">Front camera</Title>
                 <Text size="sm" c="dimmed" mb="sm">
@@ -973,7 +1063,7 @@ function App() {
                 </div>
               </Card>
             </Grid.Col>
-            <Grid.Col span={{ base: 12, md: 6 }}>
+            <Grid.Col span={{ base: 12, md: 4 }}>
               <Card shadow="sm" padding="lg" radius="md" withBorder>
                 <Title order={4} mb="xs">Occupancy (floor grid overlay)</Title>
                 <Text size="sm" c="dimmed" mb="sm">
@@ -1036,6 +1126,20 @@ function App() {
           </Grid>
 
           <Card shadow="sm" padding="lg" radius="md" withBorder>
+            <Title order={4} mb="xs">Map</Title>
+            <Text size="sm" c="dimmed" mb="sm">
+              Persistent occupancy map and robot position. Green: free, gray: occupied.
+            </Text>
+            <div style={{ minHeight: 240, background: '#1a1b1e', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              {!mapData ? (
+                <Text size="sm" c="dimmed">No map yet. Ensure ros2_app_bridge is running.</Text>
+              ) : (
+                <canvas ref={mapCanvasRef} style={{ maxWidth: '100%', height: 'auto' }} />
+              )}
+            </div>
+          </Card>
+
+          <Card shadow="sm" padding="lg" radius="md" withBorder>
             <Title order={4} mb="xs">Drive (WASD)</Title>
             <Text size="sm" c="dimmed" mb="sm">
               W forward, S back, A left, D right. Click page to enable.
@@ -1068,6 +1172,49 @@ function App() {
               >
                 {controlStatus === 'sent' ? 'Sent' : controlStatus === 'error' ? 'Error' : 'Send Frodobots control'}
               </Button>
+              <Button
+                color="green"
+                variant="filled"
+                loading={wanderLoading}
+                disabled={wanderActive}
+                onClick={async () => {
+                  setWanderLoading(true)
+                  try {
+                    const res = await fetch(`${API_BASE}/api/wander/start`, { method: 'POST' })
+                    const data = await res.json().catch(() => ({}))
+                    if (res.ok && data.ok) {
+                      setWanderActive(true)
+                    }
+                  } finally {
+                    setWanderLoading(false)
+                  }
+                }}
+              >
+                Start wander
+              </Button>
+              <Button
+                color="red"
+                variant="filled"
+                loading={wanderLoading}
+                disabled={!wanderActive}
+                onClick={async () => {
+                  setWanderLoading(true)
+                  try {
+                    const res = await fetch(`${API_BASE}/api/wander/stop`, { method: 'POST' })
+                    const data = await res.json().catch(() => ({}))
+                    if (res.ok && data.ok) {
+                      setWanderActive(false)
+                    }
+                  } finally {
+                    setWanderLoading(false)
+                  }
+                }}
+              >
+                Stop wander
+              </Button>
+              {wanderActive && (
+                <Badge color="green" variant="filled">Wander on</Badge>
+              )}
               <Button variant="filled">Create New</Button>
               <Button variant="outline">Export Data</Button>
               <Button variant="light">View Reports</Button>

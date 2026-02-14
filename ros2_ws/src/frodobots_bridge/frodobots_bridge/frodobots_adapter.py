@@ -461,9 +461,11 @@ class FrodobotsAdapter(SDKBridgeBase):
                 if self._http_fetch_count_rear == 1 or self._http_fetch_count_rear % 30 == 0:
                     self.node.get_logger().info(f"Fetched rear camera frame #{self._http_fetch_count_rear} via HTTP (size: {frame.shape})")
             
-            # Reset error count on success
+            # Reset error counts on success
             self._http_error_count = 0
-            
+            if camera_type == "front" and hasattr(self, '_front_404_count'):
+                self._front_404_count = 0
+
             return (frame, timestamp)
             
         except requests.exceptions.Timeout:
@@ -484,7 +486,21 @@ class FrodobotsAdapter(SDKBridgeBase):
                 elif self._rear_404_count >= 3:
                     self._rear_camera_disabled = True
                 return None
-            # For other errors or front camera, log normally
+            # For front camera 404: frame not ready yet (browser/session starting). Log once, then rarely.
+            if camera_type == "front" and "404" in str(e):
+                if not hasattr(self, '_front_404_count'):
+                    self._front_404_count = 0
+                self._front_404_count += 1
+                if self._front_404_count == 1:
+                    self.node.get_logger().info(
+                        "Front frame not available yet (404) - will retry (browser/session may still be starting)"
+                    )
+                elif self._front_404_count % 120 == 0:
+                    self.node.get_logger().info(
+                        f"Front frame still unavailable after {self._front_404_count} attempts - continuing to retry"
+                    )
+                return None
+            # For other errors or front non-404, log normally (throttled)
             if self._http_error_count == 1 or self._http_error_count % 30 == 0:
                 self.node.get_logger().warn(f"HTTP error fetching {camera_type} frame: {e}")
             return None

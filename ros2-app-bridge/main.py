@@ -32,8 +32,9 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 try:
     import cv2
@@ -66,7 +67,9 @@ INGEST_URL = f"{APP_SERVER_URL.rstrip('/')}/api/ingest"
 VIDEO_FRAME_RAW_URL = f"{APP_SERVER_URL.rstrip('/')}/api/video/frame/raw"
 VIDEO_OCCUPANCY_RAW_URL = f"{APP_SERVER_URL.rstrip('/')}/api/video/occupancy/frame/raw"
 WEBRTC_OFFER_URL = f"{APP_SERVER_URL.rstrip('/')}/api/webrtc/ros2-bridge/offer"
+MAP_UPDATE_URL = f"{APP_SERVER_URL.rstrip('/')}/api/map/update"
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "9000"))
+MAP_UPDATE_THROTTLE_S = 0.5
 
 # Target ~30 FPS; send raw BGR so app-server does single encode (WebRTC only)
 VIDEO_FRAME_TARGET_FPS = 30.0
@@ -74,6 +77,8 @@ VIDEO_FRAME_MIN_INTERVAL_S = 1.0 / VIDEO_FRAME_TARGET_FPS
 
 # Thread-safe queue for control commands (HTTP thread pushes, ROS2 timer drains)
 control_queue: queue.Queue = queue.Queue()
+# Queue for wander enable requests (HTTP thread pushes, ROS2 timer drains)
+wander_enable_queue: queue.Queue = queue.Queue()
 
 # WebRTC peer connections and data channels
 if HAS_WEBRTC:
@@ -88,6 +93,25 @@ else:
     webrtc_data_channel = None
     webrtc_connected = False
     webrtc_lock = threading.Lock()  # Still create lock even if WebRTC not available
+
+
+def post_map_update_sync(payload: dict) -> None:
+    """POST map and pose to app-server /api/map/update (blocking)."""
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            MAP_UPDATE_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if 200 <= resp.status < 300:
+                logger.debug("Map update POST OK")
+            else:
+                logger.warning("Map update POST returned %s", resp.status)
+    except Exception as e:
+        logger.warning("Map update POST failed: %s", e)
 
 
 def post_message(payload: dict) -> bool:
@@ -304,12 +328,10 @@ async def setup_webrtc_connection(stream_type: str, get_latest_bgr: Callable[[],
         return False
 
 
-def make_control_handler(q: queue.Queue):
+def make_control_handler(control_q: queue.Queue, wander_enable_q: queue.Queue):
     """
-    Factory for HTTP handler that pushes command dicts into the queue.
-    
-    NOTE: This is a FALLBACK handler. WebRTC data channel is preferred for control.
-    HTTP is kept for debugging and compatibility when WebRTC is not available.
+    Factory for HTTP handler: /control -> control queue, /wander/enable -> wander enable queue.
+    WebRTC data channel is preferred for control; HTTP is fallback.
     """
 
     class ControlHandler(BaseHTTPRequestHandler):
@@ -317,14 +339,39 @@ def make_control_handler(q: queue.Queue):
             logger.info("%s - %s", self.address_string(), format % args)
 
         def do_POST(self):
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length else b""
+
+            if self.path == "/wander/enable":
+                try:
+                    data = json.loads(body.decode("utf-8"))
+                    enable = data.get("enable")
+                    if not isinstance(enable, bool):
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error": "enable must be boolean"}\n')
+                        return
+                    wander_enable_q.put(enable)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok": true}\n')
+                    logger.info("Wander enable: %s", enable)
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.warning("Invalid wander/enable body: %s", e)
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8") + b"\n")
+                return
+
             if self.path != "/control":
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"error": "Not Found"}\n')
                 return
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length else b""
             try:
                 data = json.loads(body.decode("utf-8"))
                 cmd = data.get("command")
@@ -334,7 +381,7 @@ def make_control_handler(q: queue.Queue):
                     self.end_headers()
                     self.wfile.write(b'{"error": "command must be an object"}\n')
                     return
-                q.put(cmd)
+                control_q.put(cmd)
                 response_body = b'{"ok": true}\n'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -351,9 +398,11 @@ def make_control_handler(q: queue.Queue):
     return ControlHandler
 
 
-def run_control_server(port: int, q: queue.Queue) -> None:
-    """Run HTTP server for POST /control in this thread."""
-    handler = make_control_handler(q)
+def run_control_server(
+    port: int, control_q: queue.Queue, wander_enable_q: queue.Queue
+) -> None:
+    """Run HTTP server for POST /control and POST /wander/enable in this thread."""
+    handler = make_control_handler(control_q, wander_enable_q)
     with HTTPServer(("0.0.0.0", port), handler) as server:
         logger.info("Control server listening on port %s", port)
         server.serve_forever()
@@ -373,6 +422,7 @@ class Ros2AppBridge(Node):
             10,
         )
         self.control_pub = self.create_publisher(String, "/robot/control", 10)
+        self.wander_enable_pub = self.create_publisher(Bool, "/wander/enable", 10)
         # Drain control queue at 50 Hz for minimal latency (robot ← ROS2 ← webapp)
         self.control_timer = self.create_timer(0.02, self._drain_control_queue)
         
@@ -392,6 +442,7 @@ class Ros2AppBridge(Node):
         self._occupancy_lock = threading.Lock()
         self._pending_occupancy_raw: tuple[bytes, int, int] | None = None
         self._occupancy_post_future = None
+        self._map_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="map_post")
         
         # WebRTC event loop (run in separate thread)
         self._webrtc_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -428,6 +479,26 @@ class Ros2AppBridge(Node):
             self.get_logger().warn("cv2 not available; front camera streaming disabled")
         self.get_logger().info(f"Bridge: /chatter -> {INGEST_URL}")
         self.get_logger().info("Bridge: POST /control -> /robot/control (HTTP fallback)")
+        self.get_logger().info("Bridge: POST /wander/enable -> /wander/enable")
+
+        # Map and pose for app-server UI
+        self._map_lock = threading.Lock()
+        self._latest_map: Optional[dict] = None
+        self._latest_pose: Optional[dict] = None
+        self._last_map_post_time = 0.0
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            "/map",
+            self._map_callback,
+            10,
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            "/map_odom",
+            self._odom_callback,
+            10,
+        )
+        self.get_logger().info(f"Bridge: /map, /map_odom -> POST {MAP_UPDATE_URL}")
         
         # Initialize WebRTC connections if available
         if HAS_WEBRTC and HAS_CV2:
@@ -489,7 +560,7 @@ class Ros2AppBridge(Node):
                 # Keep loop running for reconnection logic
                 loop.run_forever()
             except Exception as e:
-                self.get_logger().error(f"WebRTC loop error: {e}", exc_info=True)
+                self.get_logger().error(f"WebRTC loop error: {e}")
             finally:
                 loop.close()
         
@@ -587,9 +658,7 @@ class Ros2AppBridge(Node):
         raw = image_to_bgr_bytes(msg)
         if raw is None:
             self.get_logger().warn(
-                "Occupancy frame skipped (encoding=%s); expected bgr8/rgb8/8UC3"
-                % getattr(msg, "encoding", "?"),
-                throttle_duration_sec=10.0,
+                f"Occupancy frame skipped (encoding={getattr(msg, 'encoding', '?')}); expected bgr8/rgb8/8UC3"
             )
             return
         bgr_bytes, w, h = raw
@@ -631,6 +700,42 @@ class Ros2AppBridge(Node):
                 f.add_done_callback(self._on_occupancy_post_done)
                 self._occupancy_post_future = f
 
+    def _map_callback(self, msg: OccupancyGrid) -> None:
+        with self._map_lock:
+            self._latest_map = {
+                "width": msg.info.width,
+                "height": msg.info.height,
+                "resolution": msg.info.resolution,
+                "origin": {"x": msg.info.origin.position.x, "y": msg.info.origin.position.y},
+                "data": list(msg.data),
+            }
+        self._maybe_post_map_update()
+
+    def _odom_callback(self, msg: Odometry) -> None:
+        qz = msg.pose.pose.orientation.z
+        qw = msg.pose.pose.orientation.w
+        theta = 2.0 * np.arctan2(qz, qw)
+        with self._map_lock:
+            self._latest_pose = {
+                "x": msg.pose.pose.position.x,
+                "y": msg.pose.pose.position.y,
+                "theta": float(theta),
+            }
+        self._maybe_post_map_update()
+
+    def _maybe_post_map_update(self) -> None:
+        now = time.monotonic()
+        if now - self._last_map_post_time < MAP_UPDATE_THROTTLE_S:
+            return
+        with self._map_lock:
+            map_data = self._latest_map
+            pose_data = self._latest_pose
+        if map_data is None and pose_data is None:
+            return
+        self._last_map_post_time = now
+        payload = {"map": map_data, "pose": pose_data}
+        self._map_executor.submit(post_map_update_sync, payload)
+
     def callback(self, msg: String) -> None:
         payload = {
             "topic": "/chatter",
@@ -643,7 +748,16 @@ class Ros2AppBridge(Node):
 
     def _drain_control_queue(self) -> None:
         """Drain control queue and publish to /robot/control (50 Hz for real-time).
-        When a stop (linear=0, angular=0) is seen, clear any pending commands so only stop is applied immediately."""
+        When a stop (linear=0, angular=0) is seen, clear any pending commands so only stop is applied immediately.
+        Also drain wander_enable_queue and publish to /wander/enable."""
+        try:
+            while True:
+                enable = wander_enable_queue.get_nowait()
+                msg = Bool()
+                msg.data = enable
+                self.wander_enable_pub.publish(msg)
+        except queue.Empty:
+            pass
         try:
             while True:
                 cmd = control_queue.get_nowait()
@@ -663,19 +777,25 @@ class Ros2AppBridge(Node):
 
 
 def main() -> None:
+    logger.info("ros2-app-bridge starting (APP_SERVER_URL=%s, CONTROL_PORT=%s)", APP_SERVER_URL, CONTROL_PORT)
     if not APP_SERVER_URL:
         logger.error("APP_SERVER_URL not set")
         sys.exit(1)
-    rclpy.init()
-    node = Ros2AppBridge()
+    try:
+        rclpy.init()
+        node = Ros2AppBridge()
+    except Exception as e:
+        logger.exception("Bridge failed to init (check ROS2 packages, e.g. ros-humble-nav-msgs): %s", e)
+        sys.exit(1)
 
     # Start control HTTP server in background thread
     server_thread = threading.Thread(
         target=run_control_server,
-        args=(CONTROL_PORT, control_queue),
+        args=(CONTROL_PORT, control_queue, wander_enable_queue),
         daemon=True,
     )
     server_thread.start()
+    logger.info("Control HTTP server thread started on port %s", CONTROL_PORT)
 
     try:
         rclpy.spin(node)

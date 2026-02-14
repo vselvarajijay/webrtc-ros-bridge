@@ -1,9 +1,10 @@
 # Bridge: ROS2 (rclpy) -> app-server WebRTC/HTTP. Subscribes to /robot/video/front, forwards via WebRTC tracks.
 FROM ros:humble
 
-# sensor_msgs for Image; pip for numpy + opencv + aiortc (WebRTC)
+# sensor_msgs for Image; nav_msgs for OccupancyGrid/Odometry (map and pose)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-sensor-msgs \
+    ros-humble-nav-msgs \
     python3-pip \
     libavformat-dev \
     libavcodec-dev \

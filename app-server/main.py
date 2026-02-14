@@ -59,6 +59,10 @@ latest_occupancy_bgr: "np.ndarray | None" = None
 video_stream_subscribers_occupancy: List[asyncio.Queue[bytes]] = []
 _last_occupancy_frame_time: float | None = None  # monotonic time when we last received a frame
 
+# Map and robot pose from ros2-app-bridge (POST /api/map/update)
+latest_map: dict | None = None  # { width, height, resolution, origin: {x,y}, data }
+latest_robot_pose: dict | None = None  # { x, y, theta }
+
 # Minimal 1x1 gray JPEG so stream always sends something before first real frame
 _PLACEHOLDER_JPEG = base64.b64decode(
     "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/2gAMAwEAAhEDEQA/ALJ//9k="
@@ -958,6 +962,73 @@ def control(body: ControlBody):
             )
             _last_control_forward_warning_time = now
         return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
+
+
+def _forward_wander_enable(enable: bool) -> dict:
+    """Forward wander enable to ros2-app-bridge (publishes to /wander/enable)."""
+    data = json.dumps({"enable": enable}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{ROS2_APP_BRIDGE_URL}/wander/enable",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body_resp = resp.read().decode("utf-8")
+            logger.info(
+                "Wander enable forward: enable=%s status=%s body=%s",
+                enable, resp.status, body_resp.strip() or "(empty)",
+            )
+            if 200 <= resp.status < 300:
+                return {"ok": True}
+            return {"ok": False, "error": f"Bridge returned {resp.status}"}
+    except urllib.error.URLError as e:
+        logger.warning("Forward to ros2-app-bridge /wander/enable failed: %s", e)
+        return {"ok": False, "error": str(e.reason) if getattr(e, "reason", None) else str(e)}
+
+
+@app.post("/api/wander/start")
+def wander_start():
+    """Enable wander (forward to bridge -> /wander/enable true)."""
+    return _forward_wander_enable(True)
+
+
+@app.post("/api/wander/stop")
+def wander_stop():
+    """Disable wander (forward to bridge -> /wander/enable false)."""
+    return _forward_wander_enable(False)
+
+
+@app.post("/api/map/update")
+async def map_update(request: Request):
+    """Accept map and pose from ros2-app-bridge; store for GET /api/map and /api/robot_pose."""
+    global latest_map, latest_robot_pose
+    try:
+        body = await request.json()
+        if "map" in body and body["map"] is not None:
+            latest_map = body["map"]
+        if "pose" in body and body["pose"] is not None:
+            latest_robot_pose = body["pose"]
+    except Exception as e:
+        logger.warning("Map update body error: %s", e)
+    return {"ok": True}
+
+
+@app.get("/api/map")
+def get_map():
+    """Return latest occupancy map (width, height, resolution, origin, data) for UI."""
+    if latest_map is None:
+        return JSONResponse(status_code=404, content={"error": "No map received yet"})
+    return latest_map
+
+
+@app.get("/api/robot_pose")
+def get_robot_pose():
+    """Return latest robot pose in map frame (x, y, theta) for UI."""
+    if latest_robot_pose is None:
+        return JSONResponse(status_code=404, content={"error": "No pose received yet"})
+    return latest_robot_pose
 
 
 @app.get("/api/webrtc/status")

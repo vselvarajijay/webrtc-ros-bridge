@@ -44,6 +44,7 @@ services:
       - webrtc_ros_network
 
   # ROS2 Humble container: runs frodobots_bridge + occupancy_node (occupancy_system.launch.py).
+  # Depth panel: run with enable_depth_viz:=true or use_depth_for_occupancy:=true (requires DA3 in image).
   # Rebuild after adding ROS2 packages: docker-compose build ros2_bridge
   ros2_bridge:
     build:
@@ -76,7 +77,8 @@ services:
       bash -c "source /opt/ros/humble/setup.bash
       && source /workspace/install/setup.bash
       && ros2 launch frodobots_bridge occupancy_system.launch.py
-      sdk_url:=http://frodobots:8000"
+      sdk_url:=http://frodobots:8000
+      enable_depth_viz:=true"
     networks:
       - webrtc_ros_network
 
